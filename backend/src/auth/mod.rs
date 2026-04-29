@@ -1,11 +1,14 @@
-pub mod handlers;
-
 use axum::{routing::post, Router};
 use crate::AppState;
 
+mod handlers;
+
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/register", post(handlers::register))
         .route("/login", post(handlers::login))
+        .route("/register", post(handlers::register))
         .route("/logout", post(handlers::logout))
+        .route("/me", axum::routing::get(handlers::me))
 }
+
+pub use handlers::*;
