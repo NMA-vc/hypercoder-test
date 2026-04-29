@@ -1,99 +1,111 @@
 use axum::{
-    extract::{State, Request},
-    http::{StatusCode, HeaderMap},
+    extract::{Request, State},
+    http::{header::AUTHORIZATION, StatusCode},
     response::Json,
     middleware::Next,
 };
 use serde::{Deserialize, Serialize};
-use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
-use argon2::password_hash::{rand_core::OsRng, SaltString};
-use jsonwebtoken::{encode, decode, Header, Algorithm, Validation, EncodingKey, DecodingKey};
-use chrono::{Utc, Duration};
 use validator::Validate;
-use uuid::Uuid;
-use anyhow::Result;
-use tracing::{info, warn, error};
-use std::sync::Arc;
+use tracing::{error, info};
+use chrono::{Duration, Utc};
 
 use crate::AppState;
-use crate::db::schema::User;
+use super::{jwt, password};
 
-#[derive(Debug, Serialize, Deserialize, Validate)]
-pub struct LoginRequest {
-    #[validate(email)]
+#[derive(Debug, Deserialize, Validate)]
+pub struct RegisterRequest {
+    #[validate(email(message = "Invalid email format"))]
     pub email: String,
-    #[validate(length(min = 6))]
+    #[validate(length(min = 8, message = "Password must be at least 8 characters"))]
     pub password: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Validate)]
-pub struct RegisterRequest {
-    #[validate(email)]
+#[derive(Debug, Deserialize, Validate)]
+pub struct LoginRequest {
+    #[validate(email(message = "Invalid email format"))]
     pub email: String,
-    #[validate(length(min = 6))]
+    #[validate(length(min = 1, message = "Password is required"))]
     pub password: String,
 }
 
 #[derive(Debug, Serialize)]
 pub struct AuthResponse {
-    pub success: bool,
-    pub message: String,
-    pub token: Option<String>,
-    pub user: Option<UserResponse>,
+    pub user_id: String,
+    pub email: String,
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_in: i64,
 }
 
 #[derive(Debug, Serialize)]
 pub struct UserResponse {
-    pub id: String,
+    pub user_id: String,
     pub email: String,
-    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Claims {
-    sub: String,
-    exp: usize,
-    iat: usize,
+#[derive(Debug, Serialize)]
+pub struct ErrorResponse {
+    pub error: String,
+    pub message: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RefreshRequest {
+    pub refresh_token: String,
 }
 
 pub async fn register(
     State(state): State<AppState>,
     Json(payload): Json<RegisterRequest>,
-) -> Result<Json<AuthResponse>, StatusCode> {
-    if let Err(_) = payload.validate() {
-        return Ok(Json(AuthResponse {
-            success: false,
-            message: "Invalid input".to_string(),
-            token: None,
-            user: None,
-        }));
+) -> Result<Json<AuthResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Validate input
+    if let Err(errors) = payload.validate() {
+        error!("Validation failed: {:?}", errors);
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "validation_failed".to_string(),
+                message: "Invalid input data".to_string(),
+            }),
+        ));
     }
 
     // Check if user already exists
     match state.db.find_user_by_email(&payload.email).await {
         Ok(Some(_)) => {
-            return Ok(Json(AuthResponse {
-                success: false,
-                message: "User already exists".to_string(),
-                token: None,
-                user: None,
-            }));
-        },
-        Ok(None) => {},
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: "user_exists".to_string(),
+                    message: "User with this email already exists".to_string(),
+                }),
+            ));
+        }
+        Ok(None) => {}
         Err(e) => {
-            error!("Database error checking user: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            error!("Database error checking user existence: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "database_error".to_string(),
+                    message: "Failed to check user existence".to_string(),
+                }),
+            ));
         }
     }
 
     // Hash password
-    let salt = SaltString::generate(&mut OsRng);
-    let argon2 = Argon2::default();
-    let password_hash = match argon2.hash_password(payload.password.as_bytes(), &salt) {
-        Ok(hash) => hash.to_string(),
+    let password_hash = match password::hash_password(&payload.password) {
+        Ok(hash) => hash,
         Err(e) => {
-            error!("Password hashing error: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            error!("Password hashing failed: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "password_hashing_failed".to_string(),
+                    message: "Failed to process password".to_string(),
+                }),
+            ));
         }
     };
 
@@ -101,290 +113,490 @@ pub async fn register(
     let user = match state.db.create_user(&payload.email, &password_hash).await {
         Ok(user) => user,
         Err(e) => {
-            error!("Database error creating user: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            error!("Failed to create user: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "user_creation_failed".to_string(),
+                    message: "Failed to create user".to_string(),
+                }),
+            ));
         }
     };
 
-    // Generate JWT token
     let user_id = user.id.id.to_string();
-    let token = match generate_token(&user_id, &state.config.jwt_secret) {
+    
+    // Create tokens
+    let access_token = match jwt::create_token(&user_id, &state.config.jwt_secret, 1) {
         Ok(token) => token,
         Err(e) => {
-            error!("Token generation error: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            error!("Failed to create access token: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "token_creation_failed".to_string(),
+                    message: "Failed to create access token".to_string(),
+                }),
+            ));
         }
     };
 
-    // Create session
-    let session_token = Uuid::new_v4().to_string();
-    let expires_at = Utc::now() + Duration::days(30);
-    
-    if let Err(e) = state.db.create_session(&user_id, &session_token, expires_at).await {
-        error!("Session creation error: {}", e);
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    let refresh_token = match jwt::create_token(&user_id, &state.config.jwt_secret, 24 * 7) {
+        Ok(token) => token,
+        Err(e) => {
+            error!("Failed to create refresh token: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "token_creation_failed".to_string(),
+                    message: "Failed to create refresh token".to_string(),
+                }),
+            ));
+        }
+    };
+
+    // Store refresh token in database
+    let expires_at = Utc::now() + Duration::days(7);
+    if let Err(e) = state.db.create_session(&user_id, &refresh_token, expires_at).await {
+        error!("Failed to create session: {}", e);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "session_creation_failed".to_string(),
+                message: "Failed to create session".to_string(),
+            }),
+        ));
     }
 
-    info!("User registered: {}", payload.email);
+    info!("User registered successfully: {}", user.email);
 
     Ok(Json(AuthResponse {
-        success: true,
-        message: "Registration successful".to_string(),
-        token: Some(token),
-        user: Some(UserResponse {
-            id: user_id,
-            email: user.email,
-            created_at: user.created_at,
-        }),
+        user_id,
+        email: user.email,
+        access_token,
+        refresh_token,
+        expires_in: 3600, // 1 hour in seconds
     }))
 }
 
 pub async fn login(
     State(state): State<AppState>,
     Json(payload): Json<LoginRequest>,
-) -> Result<Json<AuthResponse>, StatusCode> {
-    if let Err(_) = payload.validate() {
-        return Ok(Json(AuthResponse {
-            success: false,
-            message: "Invalid input".to_string(),
-            token: None,
-            user: None,
-        }));
+) -> Result<Json<AuthResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Validate input
+    if let Err(errors) = payload.validate() {
+        error!("Validation failed: {:?}", errors);
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "validation_failed".to_string(),
+                message: "Invalid input data".to_string(),
+            }),
+        ));
     }
 
     // Find user by email
     let user = match state.db.find_user_by_email(&payload.email).await {
         Ok(Some(user)) => user,
         Ok(None) => {
-            warn!("Login attempt for non-existent user: {}", payload.email);
-            return Ok(Json(AuthResponse {
-                success: false,
-                message: "Invalid credentials".to_string(),
-                token: None,
-                user: None,
-            }));
-        },
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse {
+                    error: "invalid_credentials".to_string(),
+                    message: "Invalid email or password".to_string(),
+                }),
+            ));
+        }
         Err(e) => {
             error!("Database error finding user: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "database_error".to_string(),
+                    message: "Failed to authenticate user".to_string(),
+                }),
+            ));
         }
     };
 
     // Verify password
-    let parsed_hash = match PasswordHash::new(&user.password_hash) {
-        Ok(hash) => hash,
-        Err(e) => {
-            error!("Password hash parsing error: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    match password::verify_password(&payload.password, &user.password_hash) {
+        Ok(true) => {},
+        Ok(false) => {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse {
+                    error: "invalid_credentials".to_string(),
+                    message: "Invalid email or password".to_string(),
+                }),
+            ));
         }
-    };
-
-    let argon2 = Argon2::default();
-    if argon2.verify_password(payload.password.as_bytes(), &parsed_hash).is_err() {
-        warn!("Invalid password for user: {}", payload.email);
-        return Ok(Json(AuthResponse {
-            success: false,
-            message: "Invalid credentials".to_string(),
-            token: None,
-            user: None,
-        }));
+        Err(e) => {
+            error!("Password verification failed: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "password_verification_failed".to_string(),
+                    message: "Failed to verify password".to_string(),
+                }),
+            ));
+        }
     }
 
-    // Generate JWT token
     let user_id = user.id.id.to_string();
-    let token = match generate_token(&user_id, &state.config.jwt_secret) {
+    
+    // Create tokens
+    let access_token = match jwt::create_token(&user_id, &state.config.jwt_secret, 1) {
         Ok(token) => token,
         Err(e) => {
-            error!("Token generation error: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            error!("Failed to create access token: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "token_creation_failed".to_string(),
+                    message: "Failed to create access token".to_string(),
+                }),
+            ));
         }
     };
 
-    // Create session
-    let session_token = Uuid::new_v4().to_string();
-    let expires_at = Utc::now() + Duration::days(30);
-    
-    if let Err(e) = state.db.create_session(&user_id, &session_token, expires_at).await {
-        error!("Session creation error: {}", e);
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    let refresh_token = match jwt::create_token(&user_id, &state.config.jwt_secret, 24 * 7) {
+        Ok(token) => token,
+        Err(e) => {
+            error!("Failed to create refresh token: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "token_creation_failed".to_string(),
+                    message: "Failed to create refresh token".to_string(),
+                }),
+            ));
+        }
+    };
+
+    // Store refresh token in database
+    let expires_at = Utc::now() + Duration::days(7);
+    if let Err(e) = state.db.create_session(&user_id, &refresh_token, expires_at).await {
+        error!("Failed to create session: {}", e);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "session_creation_failed".to_string(),
+                message: "Failed to create session".to_string(),
+            }),
+        ));
     }
 
-    info!("User logged in: {}", payload.email);
+    info!("User logged in successfully: {}", user.email);
 
     Ok(Json(AuthResponse {
-        success: true,
-        message: "Login successful".to_string(),
-        token: Some(token),
-        user: Some(UserResponse {
-            id: user_id,
-            email: user.email,
-            created_at: user.created_at,
-        }),
+        user_id,
+        email: user.email,
+        access_token,
+        refresh_token,
+        expires_in: 3600, // 1 hour in seconds
     }))
 }
 
 pub async fn logout(
-    headers: HeaderMap,
     State(state): State<AppState>,
-) -> Result<Json<AuthResponse>, StatusCode> {
-    if let Some(auth_header) = headers.get("Authorization") {
-        if let Ok(auth_str) = auth_header.to_str() {
-            if let Some(token) = auth_str.strip_prefix("Bearer ") {
-                // Delete session from database
-                if let Err(e) = state.db.delete_session(token).await {
-                    error!("Session deletion error: {}", e);
-                }
-            }
-        }
+    Json(payload): Json<RefreshRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    // Delete session from database
+    if let Err(e) = state.db.delete_session(&payload.refresh_token).await {
+        error!("Failed to delete session: {}", e);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "logout_failed".to_string(),
+                message: "Failed to logout".to_string(),
+            }),
+        ));
     }
 
-    Ok(Json(AuthResponse {
-        success: true,
-        message: "Logout successful".to_string(),
-        token: None,
-        user: None,
-    }))
+    info!("User logged out successfully");
+    Ok(StatusCode::OK)
 }
 
-pub async fn me(
-    headers: HeaderMap,
+pub async fn refresh_token(
     State(state): State<AppState>,
-) -> Result<Json<AuthResponse>, StatusCode> {
-    let token = match extract_token(&headers) {
-        Some(token) => token,
-        None => {
-            return Ok(Json(AuthResponse {
-                success: false,
-                message: "No token provided".to_string(),
-                token: None,
-                user: None,
-            }));
-        }
-    };
-
-    // Validate token and get user ID
-    let user_id = match validate_token(&token, &state.config.jwt_secret) {
+    Json(payload): Json<RefreshRequest>,
+) -> Result<Json<AuthResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Verify refresh token
+    let user_id = match jwt::extract_user_id(&payload.refresh_token, &state.config.jwt_secret) {
         Ok(user_id) => user_id,
-        Err(_) => {
-            return Ok(Json(AuthResponse {
-                success: false,
-                message: "Invalid token".to_string(),
-                token: None,
-                user: None,
-            }));
+        Err(e) => {
+            error!("Invalid refresh token: {}", e);
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse {
+                    error: "invalid_token".to_string(),
+                    message: "Invalid refresh token".to_string(),
+                }),
+            ));
         }
     };
 
-    // Get user from database
+    // Check if session exists in database
+    let session = match state.db.find_session_by_token(&payload.refresh_token).await {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse {
+                    error: "invalid_session".to_string(),
+                    message: "Session not found or expired".to_string(),
+                }),
+            ));
+        }
+        Err(e) => {
+            error!("Database error finding session: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "database_error".to_string(),
+                    message: "Failed to validate session".to_string(),
+                }),
+            ));
+        }
+    };
+
+    // Get user details
     let user = match state.db.find_user_by_id(&user_id).await {
         Ok(Some(user)) => user,
         Ok(None) => {
-            return Ok(Json(AuthResponse {
-                success: false,
-                message: "User not found".to_string(),
-                token: None,
-                user: None,
-            }));
-        },
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse {
+                    error: "user_not_found".to_string(),
+                    message: "User not found".to_string(),
+                }),
+            ));
+        }
         Err(e) => {
             error!("Database error finding user: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "database_error".to_string(),
+                    message: "Failed to find user".to_string(),
+                }),
+            ));
         }
     };
 
+    // Create new access token
+    let access_token = match jwt::create_token(&user_id, &state.config.jwt_secret, 1) {
+        Ok(token) => token,
+        Err(e) => {
+            error!("Failed to create access token: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "token_creation_failed".to_string(),
+                    message: "Failed to create access token".to_string(),
+                }),
+            ));
+        }
+    };
+
+    // Create new refresh token
+    let new_refresh_token = match jwt::create_token(&user_id, &state.config.jwt_secret, 24 * 7) {
+        Ok(token) => token,
+        Err(e) => {
+            error!("Failed to create refresh token: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "token_creation_failed".to_string(),
+                    message: "Failed to create refresh token".to_string(),
+                }),
+            ));
+        }
+    };
+
+    // Delete old session and create new one
+    if let Err(e) = state.db.delete_session(&payload.refresh_token).await {
+        error!("Failed to delete old session: {}", e);
+    }
+
+    let expires_at = Utc::now() + Duration::days(7);
+    if let Err(e) = state.db.create_session(&user_id, &new_refresh_token, expires_at).await {
+        error!("Failed to create new session: {}", e);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "session_creation_failed".to_string(),
+                message: "Failed to create session".to_string(),
+            }),
+        ));
+    }
+
+    info!("Token refreshed successfully for user: {}", user.email);
+
     Ok(Json(AuthResponse {
-        success: true,
-        message: "User found".to_string(),
-        token: Some(token),
-        user: Some(UserResponse {
-            id: user.id.id.to_string(),
-            email: user.email,
-            created_at: user.created_at,
-        }),
+        user_id: user.id.id.to_string(),
+        email: user.email,
+        access_token,
+        refresh_token: new_refresh_token,
+        expires_in: 3600, // 1 hour in seconds
     }))
 }
 
+pub async fn get_current_user(
+    user_id: UserId,
+    State(state): State<AppState>,
+) -> Result<Json<UserResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let user = match state.db.find_user_by_id(&user_id.0).await {
+        Ok(Some(user)) => user,
+        Ok(None) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "user_not_found".to_string(),
+                    message: "User not found".to_string(),
+                }),
+            ));
+        }
+        Err(e) => {
+            error!("Database error finding user: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "database_error".to_string(),
+                    message: "Failed to get user info".to_string(),
+                }),
+            ));
+        }
+    };
+
+    Ok(Json(UserResponse {
+        user_id: user.id.id.to_string(),
+        email: user.email,
+    }))
+}
+
+// Extractor for authenticated user
+#[derive(Debug, Clone)]
+pub struct UserId(pub String);
+
+#[axum::async_trait]
+impl<S> axum::extract::FromRequestParts<S> for UserId
+where
+    AppState: axum::extract::FromRef<S>,
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, Json<ErrorResponse>);
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let state: AppState = axum::extract::FromRef::from_ref(state);
+        
+        let auth_header = parts
+            .headers
+            .get(AUTHORIZATION)
+            .ok_or_else(|| {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(ErrorResponse {
+                        error: "missing_token".to_string(),
+                        message: "Authorization header missing".to_string(),
+                    }),
+                )
+            })?
+            .to_str()
+            .map_err(|_| {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(ErrorResponse {
+                        error: "invalid_header".to_string(),
+                        message: "Invalid authorization header".to_string(),
+                    }),
+                )
+            })?;
+
+        let token = auth_header
+            .strip_prefix("Bearer ")
+            .ok_or_else(|| {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(ErrorResponse {
+                        error: "invalid_token_format".to_string(),
+                        message: "Token must be in Bearer format".to_string(),
+                    }),
+                )
+            })?;
+
+        let user_id = jwt::extract_user_id(token, &state.config.jwt_secret)
+            .map_err(|e| {
+                error!("Token verification failed: {}", e);
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(ErrorResponse {
+                        error: "invalid_token".to_string(),
+                        message: "Invalid or expired token".to_string(),
+                    }),
+                )
+            })?;
+
+        Ok(UserId(user_id))
+    }
+}
+
+// Middleware for authentication
 pub async fn auth_middleware(
-    headers: HeaderMap,
     State(state): State<AppState>,
     mut request: Request,
     next: Next,
-) -> Result<axum::response::Response, StatusCode> {
-    let token = match extract_token(&headers) {
-        Some(token) => token,
-        None => return Err(StatusCode::UNAUTHORIZED),
-    };
+) -> Result<axum::response::Response, (StatusCode, Json<ErrorResponse>)> {
+    let auth_header = request
+        .headers()
+        .get(AUTHORIZATION)
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse {
+                    error: "missing_token".to_string(),
+                    message: "Authorization header missing".to_string(),
+                }),
+            )
+        })?
+        .to_str()
+        .map_err(|_| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse {
+                    error: "invalid_header".to_string(),
+                    message: "Invalid authorization header".to_string(),
+                }),
+            )
+        })?;
 
-    let user_id = match validate_token(&token, &state.config.jwt_secret) {
-        Ok(user_id) => user_id,
-        Err(_) => return Err(StatusCode::UNAUTHORIZED),
-    };
+    let token = auth_header
+        .strip_prefix("Bearer ")
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse {
+                    error: "invalid_token_format".to_string(),
+                    message: "Token must be in Bearer format".to_string(),
+                }),
+            )
+        })?;
 
-    // Add user_id to request extensions for use in handlers
-    request.extensions_mut().insert(user_id);
-    
+    let _user_id = jwt::extract_user_id(token, &state.config.jwt_secret)
+        .map_err(|e| {
+            error!("Token verification failed: {}", e);
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse {
+                    error: "invalid_token".to_string(),
+                    message: "Invalid or expired token".to_string(),
+                }),
+            )
+        })?;
+
     Ok(next.run(request).await)
-}
-
-fn extract_token(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get("Authorization")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .map(|s| s.to_string())
-}
-
-fn generate_token(user_id: &str, secret: &str) -> Result<String> {
-    let now = Utc::now();
-    let exp = (now + Duration::hours(24)).timestamp() as usize;
-    let iat = now.timestamp() as usize;
-
-    let claims = Claims {
-        sub: user_id.to_string(),
-        exp,
-        iat,
-    };
-
-    let token = encode(
-        &Header::new(Algorithm::HS256),
-        &claims,
-        &EncodingKey::from_secret(secret.as_ref()),
-    )?;
-
-    Ok(token)
-}
-
-fn validate_token(token: &str, secret: &str) -> Result<String> {
-    let validation = Validation::new(Algorithm::HS256);
-    let token_data = decode::<Claims>(
-        token,
-        &DecodingKey::from_secret(secret.as_ref()),
-        &validation,
-    )?;
-
-    Ok(token_data.claims.sub)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_token_generation_and_validation() {
-        let secret = "test_secret";
-        let user_id = "test_user";
-        
-        let token = generate_token(user_id, secret).unwrap();
-        let validated_user_id = validate_token(&token, secret).unwrap();
-        
-        assert_eq!(user_id, validated_user_id);
-    }
-
-    #[test]
-    fn test_invalid_token() {
-        let secret = "test_secret";
-        let invalid_token = "invalid.token.here";
-        
-        assert!(validate_token(invalid_token, secret).is_err());
-    }
 }
