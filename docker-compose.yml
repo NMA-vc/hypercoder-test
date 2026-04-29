@@ -1,0 +1,60 @@
+version: '3.8'
+
+services:
+  surrealdb:
+    image: surrealdb/surrealdb:v1.0.0
+    command: start --user root --pass root --bind 0.0.0.0:8000 memory
+    ports:
+      - "8000:8000"
+    environment:
+      - SURREAL_CAPS_ALLOW_ALL=true
+    volumes:
+      - surreal_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=ws://surrealdb:8000
+      - DATABASE_NS=bentoboard
+      - DATABASE_DB=main
+      - DATABASE_USER=root
+      - DATABASE_PASS=root
+      - JWT_SECRET=supersecretjwtsecretthatshouldbechangedinproduction
+      - FRONTEND_URL=http://localhost:5173
+      - RUST_LOG=debug
+    depends_on:
+      surrealdb:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    working_dir: /app
+    command: cargo run
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "5173:5173"
+    environment:
+      - PUBLIC_API_URL=http://localhost:3000
+      - PUBLIC_WS_URL=ws://localhost:3000
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    working_dir: /app
+    command: npm run dev -- --host 0.0.0.0
+    depends_on:
+      - backend
+
+volumes:
+  surreal_data:
