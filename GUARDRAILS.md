@@ -1,173 +1,166 @@
 # GUARDRAILS.md
 
 **Project:** HabitFlow
-**Stack:** tectic_v1 (Next.js / Prisma / Tailwind)
-**Owner:** Security & Performance Engineering
-**Status:** Authoritative — violations block merge.
+**Stack:** Next.js 15 (App Router) + Supabase + shadcn/ui + Tailwind
+**Version:** 1.0.0
+**Owner:** Engineering (Security & Performance)
+
+This document defines the non-negotiable guardrails for HabitFlow. All PRs MUST satisfy these rules before merge. CI MUST enforce automated checks where indicated (✅ AUTO).
 
 ---
 
-## 1. Security (OWASP Top 10 Aligned)
+## 1. Security (OWASP-Aligned)
 
-### 1.1 Authentication & Session Management
-- **Password hashing:** Use `argon2id` (preferred) or `bcrypt` cost ≥ 12. **Never** store plaintext or reversible encryption.
-- **Password policy:** Minimum 10 chars, reject top-10k common passwords (use `zxcvbn` score ≥ 3).
-- **Sessions:** Server-side, opaque tokens (≥ 256 bits CSPRNG). Stored in DB (`Session` model), 30-day rolling expiry, revoked on logout.
-- **Cookies:** `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`. **Never** store session tokens in `localStorage` or accessible JS.
-- **Rate limiting:** `/api/auth/login` and `/api/auth/register` — max **5 attempts per IP per 15 min**, exponential backoff on failure. Use sliding-window limiter (e.g., Upstash, Redis, or in-memory for MVP).
-- **Account enumeration:** Login failures must return generic `"Invalid email or password"` regardless of cause. Registration must not leak whether an email exists (return generic success + email confirmation flow if added later).
-- **Logout:** Must invalidate server-side session row, not just clear cookie.
+### 1.1 Authentication & Session Management (OWASP A07)
+- **MUST** use Supabase Auth email/password with PKCE flow only. No implicit flow.
+- **MUST** enforce password minimum 10 chars, with NIST 800-63B style validation (no forced rotation, block known-breached passwords via Supabase config).
+- **MUST** store sessions in `httpOnly`, `Secure`, `SameSite=Lax` cookies via `@supabase/ssr`. Never persist tokens in `localStorage`.
+- **MUST** validate session in `middleware.ts` for every `/(app)/*` route. Unauthenticated requests redirect to `/login`.
+- **MUST** call `supabase.auth.getUser()` (not `getSession()`) in Server Components/Actions to revalidate JWT.
+- Session inactivity timeout: **24h**. Absolute lifetime: **7d**. Refresh on activity.
 
-### 1.2 Authorization (OWASP A01: Broken Access Control)
-- **Every** route handler under `/api/habits/*`, `/api/completions/*`, `/api/summary/*` MUST:
-  1. Resolve session → `userId`.
-  2. Scope all DB queries with `where: { userId }`.
-  3. Return `404` (not `403`) on cross-user access attempts to avoid resource enumeration.
-- **No** client-supplied `userId` in request bodies — derive from session only.
-- IDs must be UUIDv4 or CUID (no sequential integers exposed in URLs).
+### 1.2 Authorization & Data Access (OWASP A01 — Broken Access Control)
+- **MUST** enable Row-Level Security (RLS) on every table in `public` schema. Migration MUST fail CI if any user-data table lacks RLS. ✅ AUTO
+- **MUST** define policies: `user_id = auth.uid()` for SELECT/INSERT/UPDATE/DELETE on `habits` and `completions`.
+- **MUST NOT** use the Supabase service-role key in any client-reachable code path. Service-role usage restricted to migrations and admin scripts only. Lint rule: forbid `SUPABASE_SERVICE_ROLE_KEY` import outside `/scripts/**`. ✅ AUTO
+- All Server Actions **MUST** re-derive `user_id` from the session — never trust client-supplied `user_id`.
 
-### 1.3 Input Validation & Injection (A03)
-- **All** request bodies validated with Zod schemas at the route boundary. Reject unknown keys (`.strict()`).
-- **Prisma only** for DB access — no raw SQL unless reviewed and parameterized.
-- **String limits:** `Habit.name` ≤ 100 chars, `Habit.description` ≤ 500 chars, `Habit.color` must match `^#[0-9A-Fa-f]{6}$`.
-- **Date validation:** `Completion.date` must be `YYYY-MM-DD`, ≤ today, ≥ today − 30 days (backfill window).
+### 1.3 Input Validation & Injection (OWASP A03)
+- **MUST** validate all Server Action inputs with Zod schemas. Reject on parse failure with generic 400.
+- Habit `name`: 1–80 chars, trimmed. `description`: ≤500 chars. `color`: regex `^#[0-9a-fA-F]{6}$`.
+- **MUST** use Supabase parameterized query builder (`.eq()`, `.insert()`). Raw SQL only in migrations.
+- **MUST** escape/sanitize any user content rendered as HTML (React handles by default; `dangerouslySetInnerHTML` is **forbidden**). ✅ AUTO via ESLint `react/no-danger`.
 
-### 1.4 XSS & Output Encoding (A03)
-- React auto-escapes — **never** use `dangerouslySetInnerHTML`.
-- User-supplied color values applied via inline `style` only after regex validation; never via `innerHTML` or class string concatenation.
+### 1.4 Cryptographic & Secret Hygiene (OWASP A02)
+- **MUST NOT** commit secrets. `.env.local` gitignored; `.env.example` contains keys only.
+- All env vars exposed to browser MUST be prefixed `NEXT_PUBLIC_*` and contain no secrets beyond the Supabase anon key.
+- TLS 1.2+ enforced end-to-end (Vercel + Supabase defaults).
+- Secret scanning (gitleaks) runs on every PR. ✅ AUTO
 
-### 1.5 CSRF (A01)
-- All mutating routes (`POST`, `PATCH`, `DELETE`) require either:
-  - `SameSite=Lax` cookie + same-origin enforcement (default for Next.js App Router fetches), **and**
-  - Custom header check (`X-Requested-With: fetch` or origin verification).
+### 1.5 Security Headers & CSRF
+- **MUST** set in `next.config.ts` headers:
+  - `Strict-Transport-Security: max-age=63072000; includeSubDomains; preload`
+  - `X-Content-Type-Options: nosniff`
+  - `X-Frame-Options: DENY`
+  - `Referrer-Policy: strict-origin-when-cross-origin`
+  - `Permissions-Policy: camera=(), microphone=(), geolocation=()`
+  - `Content-Security-Policy`: `default-src 'self'; img-src 'self' data:; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' https://*.supabase.co; frame-ancestors 'none'`
+- Server Actions are CSRF-protected by Next.js Origin checking — **MUST NOT** disable.
 
-### 1.6 Security Headers
-Set globally via `next.config.js` headers or middleware:
-```
-Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'
-Strict-Transport-Security: max-age=63072000; includeSubDomains; preload
-X-Content-Type-Options: nosniff
-X-Frame-Options: DENY
-Referrer-Policy: strict-origin-when-cross-origin
-Permissions-Policy: camera=(), microphone=(), geolocation=()
-```
+### 1.6 Logging, Monitoring & Errors (OWASP A09)
+- **MUST NOT** log PII (email, user_id beyond first 8 chars), passwords, or tokens.
+- Server errors return generic messages to clients; full stack traces only in server logs.
+- Failed login attempts logged with rate-limit counters (Supabase built-in).
 
-### 1.7 Secrets & Configuration (A05)
-- All secrets via environment variables. `.env*` files in `.gitignore`.
-- Required env: `DATABASE_URL`, `SESSION_SECRET` (≥ 32 bytes), `NODE_ENV`.
-- Fail-fast on missing/weak secrets at boot (validate with Zod in `src/lib/env.ts`).
+### 1.7 Vulnerable Components (OWASP A06)
+- `npm audit --audit-level=high` MUST pass on CI. ✅ AUTO
+- Dependabot weekly updates enabled.
+- No dependencies with <1k weekly downloads without security review.
 
-### 1.8 Dependencies & Supply Chain (A06)
-- `npm audit --production` must report **0 high/critical** vulnerabilities to merge.
-- Renovate/Dependabot enabled; weekly review.
-- Lockfile (`package-lock.json`) committed; CI uses `npm ci` only.
-
-### 1.9 Logging & Monitoring (A09)
-- Log auth events: register, login success/failure, logout, session revocation. Include hashed user id, IP, UA, timestamp.
-- **Never** log: passwords, session tokens, full email addresses (mask: `j***@example.com`).
-- 5xx errors logged with request id; no stack traces in client responses.
+### 1.8 Rate Limiting & Abuse
+- Auth endpoints: rely on Supabase rate limits (default: 30/hr per IP for sign-in).
+- `toggleCompletion`: idempotent by `unique(habit_id, completed_on)` constraint — DB enforces no duplicates.
+- Habit creation: soft cap of **200 active habits per user** (enforced in Server Action).
 
 ---
 
-## 2. Performance (Latency Targets)
+## 2. Performance
 
-### 2.1 API Latency Budgets (p95, server-side)
-| Endpoint | p95 Target | p99 Ceiling |
-|---|---|---|
-| `POST /api/auth/login` | 250 ms (incl. argon2) | 500 ms |
-| `POST /api/auth/register` | 300 ms | 600 ms |
-| `GET /api/habits` | 80 ms | 200 ms |
-| `POST /api/habits` | 100 ms | 250 ms |
-| `PATCH /api/habits/:id` | 100 ms | 250 ms |
-| `POST /api/completions` | 100 ms | 250 ms |
-| `GET /api/habits/:id/completions` | 120 ms | 300 ms |
-| `GET /api/summary/weekly` | 150 ms | 350 ms |
+### 2.1 Latency Targets (p75, EU region)
 
-### 2.2 Frontend Web Vitals (mobile, 4G, mid-tier device)
-| Metric | Target | Hard Ceiling |
+| Surface | Target | Hard Ceiling |
 |---|---|---|
-| LCP | ≤ 2.0 s | 2.5 s |
-| INP | ≤ 150 ms | 200 ms |
-| CLS | ≤ 0.05 | 0.1 |
-| FCP | ≤ 1.5 s | 2.0 s |
-| TTFB | ≤ 400 ms | 800 ms |
+| Server Action (toggleCompletion) | ≤150 ms | 400 ms |
+| Server Action (createHabit/updateHabit) | ≤200 ms | 500 ms |
+| `/` Dashboard TTFB | ≤200 ms | 500 ms |
+| `/summary` TTFB | ≤250 ms | 600 ms |
+| Auth pages TTFB | ≤150 ms | 400 ms |
+
+### 2.2 Core Web Vitals (mobile, p75)
+- **LCP** ≤ 2.0 s
+- **INP** ≤ 200 ms
+- **CLS** ≤ 0.05
+- **FCP** ≤ 1.5 s
+- Lighthouse mobile score ≥ 90 (Performance, Accessibility, Best Practices). CI runs Lighthouse on preview URL. ✅ AUTO
 
 ### 2.3 Bundle Budgets
-- Initial route JS (gzip): **≤ 130 KB** per route.
-- Total page weight on dashboard: **≤ 250 KB** gzip (excl. images).
-- No client-side date library > 15 KB (prefer `date-fns` tree-shaken or native `Intl`).
+- Initial JS (per route, gzipped): **≤ 130 KB**
+- Total JS per page: **≤ 250 KB** gzipped
+- Per-route CSS: **≤ 30 KB** gzipped
+- No single dependency >50 KB gzipped without justification (logged in PR description).
+- `@next/bundle-analyzer` report attached to PRs that change `package.json`.
 
-### 2.4 Database
-- **Required indexes:**
-  - `Session(token)` unique
-  - `Habit(user_id, archived)`
-  - `Completion(habit_id, date)` unique composite
-  - `Completion(user_id, date)`
-- N+1 prohibited: use Prisma `include`/`select` explicitly. Reviewed in PR.
-- Weekly summary query MUST be a single aggregated query, not per-habit loops.
+### 2.4 Database & Query Discipline
+- **MUST** create indexes on:
+  - `habits(user_id, archived)`
+  - `completions(user_id, completed_on)`
+  - `completions(habit_id, completed_on)` (covered by unique constraint)
+- **MUST NOT** issue N+1 queries from Server Components. Use joins or `.in()` batched fetches.
+- Dashboard query budget: **≤2 DB round-trips** per render.
+- Weekly summary: **single query** returning 7-day window.
+- All queries on user-data tables MUST filter by `user_id` explicitly (defense-in-depth alongside RLS).
 
-### 2.5 Caching
-- `GET /api/habits` and `GET /api/summary/weekly` may set `Cache-Control: private, max-age=0, must-revalidate` with ETag.
-- Static assets: immutable, 1-year max-age via Next.js defaults.
+### 2.5 Rendering Strategy
+- **Default to Server Components.** Client Components only for interactivity (theme toggle, completion toggle, mobile nav).
+- **MUST** use `revalidatePath('/')` after mutations — no full page reloads.
+- Optimistic UI for `toggleCompletion` via `useOptimistic`.
+- No client-side data fetching libraries (SWR/React Query) for MVP — Server Components only.
+- `next/image` required for any raster images. `next/font` for all fonts (no external font CDNs).
 
-### 2.6 Streak Calculation
-- O(n) over completions for a single habit. Bounded scan (max 365 days lookback) — never full-table scan.
-- Cache current/longest streak in memo per request; invalidate on completion mutation.
+### 2.6 Caching
+- Static auth pages: `force-static` where possible.
+- Dashboard/Summary: `dynamic = 'force-dynamic'` (per-user data).
+- HTTP cache headers managed by Next.js defaults; do not override without review.
 
 ---
 
-## 3. Styling (System Defaults)
+## 3. Styling & UI Conventions (System Defaults)
 
-### 3.1 Foundations
-- **Framework:** Tailwind CSS only. No CSS-in-JS, no separate `.module.css` unless justified.
-- **Typography:** System font stack — `ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif`. **No web fonts** in MVP (perf + GDPR).
-- **Color tokens:** Defined in `tailwind.config.ts` under `theme.extend.colors`. Components reference tokens, never raw hex (except validated user habit color).
-- **Spacing:** Tailwind 4px scale only (`p-1`, `p-2`, …). No arbitrary `[13px]` values without comment.
+### 3.1 Component Library
+- **MUST** use shadcn/ui primitives. Do not introduce alternative UI libs (MUI, Chakra, Mantine, etc.).
+- New components live in `components/ui/` (shadcn) or `components/` (composed). No styled-components or CSS-in-JS runtime libs.
+- Tailwind utility classes only. No custom CSS files except `globals.css` (tokens + resets).
 
-### 3.2 Theming (Light/Dark)
-- Implemented via `class="dark"` on `<html>` (Tailwind `darkMode: 'class'`).
-- Theme persisted to `localStorage` key `habitflow:theme` (`light` | `dark` | `system`).
-- Default = `system` (respects `prefers-color-scheme`).
-- All components MUST provide both light and dark variants. Acceptance: visual diff in both modes.
+### 3.2 Theming
+- **MUST** use `next-themes` with `attribute="class"`, `defaultTheme="system"`, `enableSystem`.
+- All colors via CSS variables (`--background`, `--foreground`, etc.) defined in `globals.css`. No hardcoded hex outside the `color` field of a Habit.
+- **MUST NOT** introduce flash of unstyled content: `suppressHydrationWarning` on `<html>`, theme script in `<head>`.
 
-### 3.3 Accessibility (WCAG 2.1 AA)
-- Color contrast ≥ **4.5:1** for body text, **3:1** for large text and UI components — verified for both themes.
-- All interactive elements: focus-visible ring (`focus-visible:ring-2`), keyboard-operable.
-- Touch targets ≥ **44×44 px** (per BuildSpec).
-- Semantic HTML; ARIA only where semantics insufficient.
-- Form fields: associated `<label>`, error messages tied via `aria-describedby`.
+### 3.3 Responsive & Accessibility
+- **Mobile-first**. Layouts MUST work at 375 × 667 viewport with no horizontal overflow.
+- Tap targets **≥ 44 × 44 px** (Apple HIG / WCAG 2.5.5).
+- Breakpoints: Tailwind defaults (`sm 640`, `md 768`, `lg 1024`). Do not customize.
+- WCAG 2.1 AA color contrast (≥ 4.5:1 for body text, ≥ 3:1 for large text/UI).
+- Every interactive element MUST be keyboard-operable with visible focus ring.
+- Forms MUST use `<label>` (or `aria-label`) and announce errors via `aria-live`.
+- `axe-core` checks in Playwright E2E. Zero serious/critical violations. ✅ AUTO
 
-### 3.4 Responsive Design
-- Mobile-first. Breakpoints: Tailwind defaults (`sm:640`, `md:768`, `lg:1024`, `xl:1280`).
-- Layouts MUST work from **320px** width with no horizontal scroll.
-- Navigation collapses to bottom nav or hamburger below `md`.
+### 3.4 Typography & Spacing
+- Use shadcn typographic scale (Tailwind `text-sm/base/lg/xl/2xl`). No arbitrary `text-[13px]`.
+- Spacing on Tailwind scale (`p-2`, `gap-4`). Arbitrary values discouraged; require comment if used.
 
-### 3.5 Component Conventions
-- File naming: `PascalCase.tsx`. One component per file.
-- Props typed via TypeScript `interface`. No `any`.
-- Server Components by default; `"use client"` only when needed (forms, theme toggle, completion checkbox).
+### 3.5 Iconography
+- **MUST** use `lucide-react`. No mixing icon libraries.
 
 ---
 
 ## 4. Compliance (GDPR / EU-Native)
 
-### 4.1 Lawful Basis & Data Minimization
-- **Lawful basis:** Contract performance (Art. 6(1)(b)) for account & habit data; legitimate interest for security logs.
-- **Data minimization (Art. 5(1)(c)):** Collect only `email`, `password_hash`, `theme_preference`, habit data. **No** analytics, fingerprinting, IP geolocation, or behavioral tracking in MVP.
+HabitFlow is treated as **EU-native** by default: EU data residency, GDPR-compliant by design, even though no formal compliance requirement was specified. Cost of retrofit > cost of upfront.
 
-### 4.2 Hosting & Data Residency
-- **All processing in EU.** Required:
-  - Hosting region: EU (e.g., Vercel `fra1`/`cdg1`, Hetzner DE/FI, Scaleway FR).
-  - Database region: EU only.
-  - No US-based sub-processors (rules out US-region Vercel KV, Supabase US, etc.) without DPA + SCCs review.
-- Document chosen sub-processors in `docs/SUBPROCESSORS.md`.
+### 4.1 Data Residency
+- Supabase project **MUST** be provisioned in an EU region (`eu-central-1` Frankfurt or `eu-west-1` Ireland).
+- Vercel deployment region pinned to **`fra1` (Frankfurt)**.
+- No third-party processors outside EU/EEA without a documented SCC (Standard Contractual Clauses).
 
-### 4.3 Cookies & Tracking
-- Only **strictly necessary** cookies in MVP (session cookie). No consent banner required under ePrivacy.
-- **No** third-party analytics, tag managers, fonts (Google Fonts ❌), or CDNs that proxy user IPs outside EU.
+### 4.2 Lawful Basis & Data Minimization (GDPR Art. 5, 6)
+- Lawful basis: **performance of contract** (providing the habit tracker service the user signed up for).
+- Personal data collected limited to:
+  - `auth.users.email` — required for authentication
+  - `auth.users.id` — internal identifier
+  - Habit content (user-generated; not classified as special-category data)
+- **MUST NOT** collect: name, location, IP for analytics, device fingerprints, behavioral telemetry.
+- **MUST NOT** add analytics, ad pixels, or session-replay tools without DPIA + consent flow.
 
-### 4.4 User Rights (Art. 15–22)
-MVP must support, even if manually via admin script initially:
-- **Access (Art. 15):** Export user's habits, completions, account data as JSON.
-- **Erasure (Art. 17):** Hard-delete `User`, cascade `Habit`, `Completion`, `Session` rows. Confirm within 30 days.
-- **Rectification (Art. 16):** Email change endpoint (post-MVP acceptable; document
+### 4.3 Cookies & Consent (ePrivacy)
+- Only **strictly necessary** cook

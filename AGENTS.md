@@ -1,244 +1,199 @@
-# AGENTS.md
+# AGENTS.md — HabitFlow Specialist Fleet
 
-# HabitFlow — Specialist Agent Fleet
+This document defines the specialist agent fleet responsible for building **HabitFlow**, a mobile-first habit tracker built on Next.js 15 (App Router), Supabase, and shadcn/ui.
 
-This document defines the specialist agent fleet responsible for building HabitFlow. Each agent owns a focused vertical of the system and is accountable for the files listed under "Owned Files." Agents coordinate via the task graph defined in the BuildSpec; cross-cutting changes require sign-off from all owning agents.
-
-**Stack:** `tectic_v1` (Next.js App Router + TypeScript + Tailwind + Prisma)
-**Coordination model:** Wave-based execution per `task_graph`. Agents within the same wave may execute in parallel; downstream waves block on upstream completion.
+Each agent owns a distinct slice of the system. Files are owned exclusively to prevent merge conflicts during parallel waves. Agents must coordinate across declared dependencies via the task graph.
 
 ---
 
-## 1. PlatformEngineer
+## Conventions
 
-**Role:** Owns project scaffolding, build tooling, and cross-cutting configuration. The first agent to execute and the gatekeeper for all dependency / config changes.
+- **Stack:** Next.js 15 App Router, TypeScript, Tailwind CSS, shadcn/ui, Supabase (Auth + Postgres + RLS), next-themes, Playwright.
+- **Server-first:** Prefer Server Components and Server Actions; Client Components only when interactivity demands.
+- **Security:** All DB access goes through Supabase RLS; no service-role key in client bundles.
+- **Dates:** UTC in DB; `today` derived from browser timezone at the edge (Server Action receives client-provided date string `YYYY-MM-DD`).
+- **Testing:** Unit tests colocated; E2E in `/e2e`.
+
+---
+
+## 1. PlatformSpecialist
+
+**Role:** Bootstraps and maintains the project shell, build pipeline, and shared design tokens.
 
 **Capabilities:**
-- Initialize Next.js + TypeScript + Tailwind project
-- Configure tsconfig paths, Tailwind theme tokens (incl. dark mode class strategy), Next.js runtime config
-- Maintain dependency hygiene and lockfile
-- Wire up linting/formatting baselines
+- Next.js 15 + App Router scaffolding
+- Tailwind v4 configuration and shadcn/ui CLI integration
+- Root layout, font loading, global styles
+- Vercel deployment configuration
 
-**Owned Files:**
+**Owned files:**
 - `package.json`
-- `tsconfig.json`
+- `next.config.ts`
 - `tailwind.config.ts`
-- `next.config.js`
+- `app/layout.tsx`
+- `app/globals.css`
+- `components.json`
+- `vercel.json`
+- `README.md`
 
-**Tasks:** `t1`
-**Dependencies:** None (Wave 0 entry point)
+**Tasks:** T01, T15
+
+**Coordination:** Provides the foundation all other agents depend on. Must publish initial commit before Wave 1 begins.
 
 ---
 
 ## 2. DBSpecialist
 
-**Role:** Owns the data layer: schema, migrations, and Prisma client conventions. Single source of truth for the `User`, `Habit`, `Completion`, and `Session` models.
+**Role:** Owns the Postgres schema, migrations, and Row Level Security policies in Supabase.
 
 **Capabilities:**
-- Author Prisma schema with proper relations, indices (e.g. `(habit_id, date)` unique), and cascade rules
-- Generate and version migrations
-- Enforce timezone-safe date storage (UTC `DATE` columns) — directly mitigates risk: *"Streak calc errors across timezones"*
-- Provide DB seed scripts for local dev
+- SQL DDL and migration authoring
+- Supabase RLS policy design (per-user isolation on `habits` and `completions`)
+- Index design (e.g., `(user_id, archived)`, unique `(habit_id, completed_on)`)
+- Schema review for streak/timezone edge cases
 
-**Owned Files:**
-- `prisma/schema.prisma`
-- `prisma/migrations/`
+**Owned files:**
+- `supabase/migrations/0001_init.sql`
 
-**Tasks:** `t2`
-**Dependencies:** `t1`
+**Tasks:** T03
+
+**Coordination:** Publishes schema before T07 (server actions) and T11 (streaks). Risk owner for **RLS misconfiguration leaking data**.
 
 ---
 
 ## 3. AuthSpecialist
 
-**Role:** Owns authentication, session lifecycle, and route protection. Roll-your-own implementation — explicit risk owner for *"Auth security via roll-your-own implementation."*
+**Role:** Implements Supabase Auth integration: signup, login, logout, session middleware, and protected layout enforcement.
 
 **Capabilities:**
-- Implement bcrypt/argon2 password hashing
-- Issue and validate session tokens stored in `Session` table; HttpOnly + Secure + SameSite cookies
-- Build Next.js middleware to gate authenticated routes and redirect unauth users to `/login`
-- Implement `/api/auth/register`, `/api/auth/login`, `/api/auth/logout`
-- Provide `getCurrentUser()` server helper consumed by all downstream API routes
+- Supabase SSR client (`@supabase/ssr`) wiring for browser, server, and middleware
+- Email/password flows + auth callback route
+- Cookie-based session refresh in middleware
+- Redirect logic for unauthenticated users
 
-**Owned Files:**
-- `src/lib/auth.ts`
-- `src/middleware.ts`
-- `src/app/api/auth/`
-- `src/app/(auth)/login/page.tsx`
-- `src/app/(auth)/register/page.tsx`
+**Owned files:**
+- `lib/supabase/client.ts`
+- `lib/supabase/server.ts`
+- `lib/supabase/middleware.ts`
+- `middleware.ts`
+- `.env.example`
+- `app/login/page.tsx`
+- `app/signup/page.tsx`
+- `app/auth/actions.ts`
+- `app/auth/callback/route.ts`
 
-**Tasks:** `t3`, `t4`
-**Dependencies:** `t2`
+**Tasks:** T02, T05
+
+**Coordination:** Auth client consumed by every server action and protected page. Must complete T02 before any data-layer work begins.
 
 ---
 
-## 4. HabitsAPISpecialist
+## 4. FrontendArchitect
 
-**Role:** Owns the Habit resource: CRUD endpoints with strict ownership enforcement (users may only mutate their own habits).
+**Role:** Owns the application shell, navigation, theming, and shared UI primitives.
 
 **Capabilities:**
-- Implement `GET/POST /api/habits` and `GET/PATCH/DELETE /api/habits/:id`
-- Validate request bodies (zod or equivalent) for `name`, `description`, `color`, `archived`
-- Enforce `habit.user_id === session.user_id` on every mutation
-- Soft-archive semantics rather than hard delete where appropriate
+- Protected `(app)` route group layout
+- next-themes integration (system + manual toggle, no FOUC)
+- Desktop nav and mobile drawer nav
+- Responsive design system enforcement (375px baseline, ≥44px tap targets)
 
-**Owned Files:**
-- `src/app/api/habits/route.ts`
-- `src/app/api/habits/[id]/route.ts`
+**Owned files:**
+- `components/theme-provider.tsx`
+- `components/theme-toggle.tsx`
+- `app/(app)/layout.tsx`
+- `components/nav.tsx`
+- `components/mobile-nav.tsx`
 
-**Tasks:** `t5`
-**Dependencies:** `t3`
+**Tasks:** T04, T06, T13
+
+**Coordination:** Consumes AuthSpecialist's server client to gate the `(app)` group. Provides shell that FeatureSpecialist pages render into.
 
 ---
 
-## 5. CompletionsEngineer
+## 5. DomainSpecialist
 
-**Role:** Owns daily completion logging and streak computation. Risk owner for *"Streak calc errors across timezones"* and *"Backfill abuse skewing analytics."*
+**Role:** Owns the domain logic — habit/completion server actions, types, and streak computation.
 
 **Capabilities:**
-- Implement `POST /api/completions` (toggle semantics: creates or deletes), `DELETE /api/completions/:id`, `GET /api/habits/:id/completions`
-- Enforce 30-day backfill window server-side (reject `date` older than `today - 30d` UTC)
-- Enforce uniqueness `(habit_id, date)` to prevent double-logging
-- Compute current streak (resets on missed day) and longest streak (historical max) in `src/lib/streaks.ts`
-- Provide pure, deterministic streak functions covered by unit tests
+- Zod input validation for server actions
+- Idempotent completion toggle (insert-or-delete on `(habit_id, completed_on)`)
+- Pure streak algorithm (current + longest) with DST/timezone-safe date math
+- TypeScript domain types shared across UI and actions
+- Unit tests for streak edge cases
 
-**Owned Files:**
-- `src/app/api/completions/route.ts`
-- `src/lib/streaks.ts`
+**Owned files:**
+- `lib/types.ts`
+- `app/(app)/habits/actions.ts`
+- `app/(app)/completions/actions.ts`
+- `lib/streaks.ts`
+- `lib/streaks.test.ts`
 
-**Tasks:** `t6`
-**Dependencies:** `t5`
+**Tasks:** T07, T09, T11
+
+**Coordination:** Depends on DBSpecialist's schema. Risk owner for **timezone handling** and **streak edge cases around DST**. Server actions must call `revalidatePath` for affected routes.
 
 ---
 
-## 6. FrontendArchitect
+## 6. FeatureSpecialist
 
-**Role:** Owns the dashboard shell, habit-management UI, and component contracts consumed by other UI agents. Sets visual + interaction conventions for the app.
+**Role:** Builds the user-facing feature pages and habit-specific components.
 
 **Capabilities:**
-- Build dashboard route, habit list rendering, and create/edit forms
-- Define `HabitCard` props consumed by `CompletionToggle` and `WeekGrid`
-- Surface streak data from `src/lib/streaks.ts` on each habit card
-- Coordinate with ThemeSpecialist and UXResponsiveSpecialist on shared component patterns
+- Habit management UI (list, create form, edit, archive)
+- Today's dashboard with optimistic completion toggling (`useOptimistic`)
+- Weekly 7-day grid with completion percentage
+- Mobile-first composition using shadcn primitives
 
-**Owned Files:**
-- `src/app/dashboard/page.tsx`
-- `src/components/HabitCard.tsx`
-- `src/components/HabitForm.tsx`
+**Owned files:**
+- `app/(app)/habits/page.tsx`
+- `app/(app)/habits/new/page.tsx`
+- `components/habit-form.tsx`
+- `app/(app)/page.tsx`
+- `components/habit-row.tsx`
+- `app/(app)/summary/page.tsx`
+- `components/week-grid.tsx`
 
-**Tasks:** `t7`
-**Dependencies:** `t5`
+**Tasks:** T08, T10, T12
+
+**Coordination:** Consumes DomainSpecialist's actions/types and FrontendArchitect's layout. Must pass `today` (client-derived `YYYY-MM-DD`) into completion actions to honor browser timezone.
 
 ---
 
-## 7. LoggingUXSpecialist
+## 7. QASpecialist
 
-**Role:** Owns the daily completion interaction surface, including backfill UI.
-
-**Capabilities:**
-- Build `CompletionToggle` (checkbox-style; tap to mark, re-tap to unmark)
-- Build `DatePicker` constrained to last 30 days (UI mirror of backfill window)
-- Optimistic updates with rollback on API failure
-- Ensure 44px+ touch targets (coordinated with UXResponsiveSpecialist)
-
-**Owned Files:**
-- `src/components/CompletionToggle.tsx`
-- `src/components/DatePicker.tsx`
-
-**Tasks:** `t8`
-**Dependencies:** `t6`, `t7`
-
----
-
-## 8. AnalyticsSpecialist
-
-**Role:** Owns the weekly summary feature end-to-end (API + UI).
+**Role:** End-to-end test coverage for critical user journeys.
 
 **Capabilities:**
-- Implement `GET /api/summary/weekly` returning per-habit 7-day completion grid + overall % completion
-- Build `WeekGrid` component (7 cells, completion state per day)
-- Build `/summary` page assembling per-habit grids
-- Ensure summary updates reactively after a completion is logged (revalidation strategy)
+- Playwright configuration (multi-browser, mobile viewport)
+- Auth journey tests (signup → login → protected route)
+- Habit CRUD + completion toggle smoke tests
+- CI-friendly test runs against ephemeral Supabase project
 
-**Owned Files:**
-- `src/app/summary/page.tsx`
-- `src/app/api/summary/weekly/route.ts`
-- `src/components/WeekGrid.tsx`
-
-**Tasks:** `t9`
-**Dependencies:** `t6`, `t7`
-
----
-
-## 9. ThemeSpecialist
-
-**Role:** Owns dark-mode infrastructure and theme persistence.
-
-**Capabilities:**
-- Implement `ThemeProvider` (React context, hydration-safe)
-- Implement `ThemeToggle` placed in header
-- Persist user choice in `localStorage`; respect `User.theme_preference` when authenticated
-- Audit Tailwind class usage to guarantee both modes render correctly
-
-**Owned Files:**
-- `src/components/ThemeProvider.tsx`
-- `src/components/ThemeToggle.tsx`
-
-**Tasks:** `t10`
-**Dependencies:** `t1`
-
----
-
-## 10. UXResponsiveSpecialist
-
-**Role:** Owns global layout, navigation, and responsive behavior from 320px upward.
-
-**Capabilities:**
-- Build `Layout` shell (header, content, footer slots)
-- Build `MobileNav` with collapsing behavior on small screens
-- Maintain `globals.css` (resets, typography, base tokens)
-- Enforce no-horizontal-scroll and 44px touch-target rules across the app
-
-**Owned Files:**
-- `src/components/Layout.tsx`
-- `src/components/MobileNav.tsx`
-- `src/app/globals.css`
-
-**Tasks:** `t11`
-**Dependencies:** `t7`
-
----
-
-## 11. QAEngineer
-
-**Role:** Owns the test pyramid: unit coverage for pure logic (esp. streaks) and end-to-end coverage for acceptance criteria.
-
-**Capabilities:**
-- Configure Playwright for E2E flows: register → create habit → log completion → backfill → view summary
-- Write unit tests for `src/lib/streaks.ts` covering edge cases (timezone boundaries, missed days, backfill insertion)
-- Write API integration tests for ownership enforcement and 30-day backfill rejection
-- Smoke-test dark mode and mobile viewports
-
-**Owned Files:**
-- `tests/`
+**Owned files:**
 - `playwright.config.ts`
+- `e2e/auth.spec.ts`
+- `e2e/habits.spec.ts`
 
-**Tasks:** `t12`
-**Dependencies:** `t8`, `t9`
+**Tasks:** T14
+
+**Coordination:** Final gate before T15 (deploy). Validates acceptance criteria across all features.
 
 ---
 
-## Execution Waves
+## Wave Execution Plan
 
 | Wave | Agents Active | Tasks |
 |------|---------------|-------|
-| 0 | PlatformEngineer → DBSpecialist → AuthSpecialist | t1, t2, t3 |
-| 1 | AuthSpecialist, HabitsAPISpecialist, CompletionsEngineer, FrontendArchitect, LoggingUXSpecialist | t4, t5, t6, t7, t8 |
-| 2 | AnalyticsSpecialist, ThemeSpecialist, UXResponsiveSpecialist, QAEngineer | t9, t10, t11, t12 |
+| **0** | PlatformSpecialist, AuthSpecialist (setup), DBSpecialist, FrontendArchitect (theme) | T01, T02, T03, T04 |
+| **1** | AuthSpecialist (pages), FrontendArchitect (shell), DomainSpecialist, FeatureSpecialist | T05, T06, T07, T08, T09, T10 |
+| **2** | DomainSpecialist (streaks), FeatureSpecialist (summary), FrontendArchitect (mobile), QASpecialist, PlatformSpecialist (deploy) | T11, T12, T13, T14, T15 |
 
-## Cross-Cutting Conventions
+---
 
-- **Authorization:** Every API route handler (outside `/api/auth/*`) MUST call `getCurrentUser()` from `src/lib/auth.ts` and reject with 401 on miss. AuthSpecialist owns this contract.
-- **Dates:** All persisted dates are UTC `DATE`. Client-to-server conversion happens at API boundaries. CompletionsEngineer owns this contract.
-- **Ownership checks:** All mutations on `Habit` and `Completion` MUST verify `resource.user_id === session.user_id`. HabitsAPISpecialist + CompletionsEngineer co-own.
-- **Component theming:** New UI components MUST be reviewed against light + dark palettes before merge. ThemeSpecialist signs off.
+## Cross-Cutting Responsibilities
+
+- **Risk: Timezone for "today"** — Owned by DomainSpecialist; mitigated by FeatureSpecialist passing client-local date into actions.
+- **Risk: RLS data leakage** — Owned by DBSpecialist; verified by QASpecialist via cross-account E2E assertion.
+- **Risk: Streak DST edge cases** — Owned by DomainSpecialist; covered by `lib/streaks.test.ts`.
+- **Out of scope (do not implement):** push/email reminders, social features, payments, custom frequencies, native apps, historical analytics beyond weekly view, data export.
