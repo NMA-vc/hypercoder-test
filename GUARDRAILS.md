@@ -1,186 +1,173 @@
 # GUARDRAILS.md
 
-> **Project:** BentoBoard
-> **Stack:** Rust (Axum + Tokio) · SurrealDB · SvelteKit
-> **Scope:** Single-tenant, self-hosted MVP
-> **Owner:** Security & Performance Engineering
-
-This document defines the **non-negotiable guardrails** for the BentoBoard project. All code, infrastructure, and design decisions MUST comply with these rules. PRs that violate guardrails MUST be blocked at CI.
+**Project:** HabitFlow
+**Stack:** tectic_v1 (Next.js / Prisma / Tailwind)
+**Owner:** Security & Performance Engineering
+**Status:** Authoritative — violations block merge.
 
 ---
 
-## 1. Security (OWASP-Aligned)
+## 1. Security (OWASP Top 10 Aligned)
 
-BentoBoard follows the **OWASP ASVS Level 2** baseline and the **OWASP Top 10 (2021)** as primary threat references.
+### 1.1 Authentication & Session Management
+- **Password hashing:** Use `argon2id` (preferred) or `bcrypt` cost ≥ 12. **Never** store plaintext or reversible encryption.
+- **Password policy:** Minimum 10 chars, reject top-10k common passwords (use `zxcvbn` score ≥ 3).
+- **Sessions:** Server-side, opaque tokens (≥ 256 bits CSPRNG). Stored in DB (`Session` model), 30-day rolling expiry, revoked on logout.
+- **Cookies:** `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`. **Never** store session tokens in `localStorage` or accessible JS.
+- **Rate limiting:** `/api/auth/login` and `/api/auth/register` — max **5 attempts per IP per 15 min**, exponential backoff on failure. Use sliding-window limiter (e.g., Upstash, Redis, or in-memory for MVP).
+- **Account enumeration:** Login failures must return generic `"Invalid email or password"` regardless of cause. Registration must not leak whether an email exists (return generic success + email confirmation flow if added later).
+- **Logout:** Must invalidate server-side session row, not just clear cookie.
 
-### 1.1 Authentication & Session Management (A07)
-
-- **Password hashing:** MUST use `argon2` (Argon2id, m=19456 KiB, t=2, p=1) via the `argon2` crate. **NEVER** use MD5, SHA-1, SHA-256, or bcrypt.
-- **Password policy:** Minimum 12 characters; reject passwords found in the HIBP top-10k list (compile-time embedded).
-- **JWT:**
-  - Algorithm MUST be `HS256` (or `EdDSA` if upgraded). `alg: none` MUST be rejected explicitly.
-  - Secret MUST be ≥ 256 bits, loaded from env var `JWT_SECRET`, **never** hardcoded or committed.
-  - Token TTL: **15 minutes** for access; refresh via Session record (TTL 7 days).
-  - Claims MUST include `sub`, `iat`, `exp`, `jti`. Validate all on every request.
-- **Session storage:** Sessions persisted in SurrealDB with `expires_at`; expired sessions purged hourly.
-- **Logout:** MUST revoke session server-side (delete row); client clears token.
-- **Brute-force protection:** Login endpoint rate-limited to **5 attempts / 15 min / IP+email** (tower-governor).
-
-### 1.2 Authorization (A01 — Broken Access Control)
-
-- **Every** widget/dashboard handler MUST verify `widget.user_id == claims.sub` before read/write/delete.
-- Authorization checks MUST be enforced in the handler/service layer, not relying solely on query filters.
-- No client-supplied `user_id` in request bodies — always derived from JWT claims.
-- Default deny: any new route MUST be explicitly added to the auth middleware allow-list or it is protected by default.
+### 1.2 Authorization (OWASP A01: Broken Access Control)
+- **Every** route handler under `/api/habits/*`, `/api/completions/*`, `/api/summary/*` MUST:
+  1. Resolve session → `userId`.
+  2. Scope all DB queries with `where: { userId }`.
+  3. Return `404` (not `403`) on cross-user access attempts to avoid resource enumeration.
+- **No** client-supplied `userId` in request bodies — derive from session only.
+- IDs must be UUIDv4 or CUID (no sequential integers exposed in URLs).
 
 ### 1.3 Input Validation & Injection (A03)
+- **All** request bodies validated with Zod schemas at the route boundary. Reject unknown keys (`.strict()`).
+- **Prisma only** for DB access — no raw SQL unless reviewed and parameterized.
+- **String limits:** `Habit.name` ≤ 100 chars, `Habit.description` ≤ 500 chars, `Habit.color` must match `^#[0-9A-Fa-f]{6}$`.
+- **Date validation:** `Completion.date` must be `YYYY-MM-DD`, ≤ today, ≥ today − 30 days (backfill window).
 
-- All request bodies MUST be parsed via `serde` into typed structs with `validator` constraints (length, regex, enum).
-- SurrealDB queries MUST use **parameterized bindings** (`$param`). String concatenation into SurrealQL is forbidden.
-- WebSocket messages MUST be deserialized into typed enums; unknown message types MUST be dropped + logged.
-- Widget `config` JSON MUST be size-capped at **16 KiB** and schema-validated per widget `type`.
+### 1.4 XSS & Output Encoding (A03)
+- React auto-escapes — **never** use `dangerouslySetInnerHTML`.
+- User-supplied color values applied via inline `style` only after regex validation; never via `innerHTML` or class string concatenation.
 
-### 1.4 Cryptographic Failures (A02)
+### 1.5 CSRF (A01)
+- All mutating routes (`POST`, `PATCH`, `DELETE`) require either:
+  - `SameSite=Lax` cookie + same-origin enforcement (default for Next.js App Router fetches), **and**
+  - Custom header check (`X-Requested-With: fetch` or origin verification).
 
-- TLS 1.2+ enforced at the reverse proxy (Caddy/Traefik) — HTTP redirects to HTTPS.
-- HSTS: `max-age=63072000; includeSubDomains; preload`.
-- Cookies (if used): `Secure`, `HttpOnly`, `SameSite=Strict`.
-- Secrets MUST be loaded from environment or Docker secrets; **never** from repo or logs.
+### 1.6 Security Headers
+Set globally via `next.config.js` headers or middleware:
+```
+Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'
+Strict-Transport-Security: max-age=63072000; includeSubDomains; preload
+X-Content-Type-Options: nosniff
+X-Frame-Options: DENY
+Referrer-Policy: strict-origin-when-cross-origin
+Permissions-Policy: camera=(), microphone=(), geolocation=()
+```
 
-### 1.5 Security Headers (Frontend & API)
+### 1.7 Secrets & Configuration (A05)
+- All secrets via environment variables. `.env*` files in `.gitignore`.
+- Required env: `DATABASE_URL`, `SESSION_SECRET` (≥ 32 bytes), `NODE_ENV`.
+- Fail-fast on missing/weak secrets at boot (validate with Zod in `src/lib/env.ts`).
 
-| Header | Value |
-|---|---|
-| `Content-Security-Policy` | `default-src 'self'; connect-src 'self' wss:; img-src 'self' data:; style-src 'self' 'unsafe-inline'` |
-| `X-Content-Type-Options` | `nosniff` |
-| `X-Frame-Options` | `DENY` |
-| `Referrer-Policy` | `strict-origin-when-cross-origin` |
-| `Permissions-Policy` | `geolocation=(), microphone=(), camera=()` |
+### 1.8 Dependencies & Supply Chain (A06)
+- `npm audit --production` must report **0 high/critical** vulnerabilities to merge.
+- Renovate/Dependabot enabled; weekly review.
+- Lockfile (`package-lock.json`) committed; CI uses `npm ci` only.
 
-### 1.6 CORS
-
-- Allowed origin: configured `FRONTEND_URL` only. Wildcard `*` is **forbidden** when credentials are sent.
-- Allowed methods: `GET, POST, PATCH, DELETE`. Allowed headers: `Authorization, Content-Type`.
-
-### 1.7 Logging & Monitoring (A09)
-
-- Use `tracing` with structured JSON logs in production.
-- **Forbidden in logs:** passwords, JWTs, full session tokens, email addresses (hash or mask), widget `config` payloads.
-- All auth events (`login_success`, `login_fail`, `register`, `logout`, `token_invalid`) MUST be logged with correlation ID.
-
-### 1.8 Dependencies (A06)
-
-- `cargo audit` MUST run in CI; build fails on any RUSTSEC advisory ≥ Medium.
-- `npm audit --production` MUST pass with zero High/Critical.
-- Dependabot/Renovate enabled; security patches merged within **7 days**.
-
-### 1.9 WebSocket Security
-
-- WS upgrade MUST require valid JWT (via `Sec-WebSocket-Protocol` or first message handshake).
-- Per-connection rate limit: **100 msgs/sec**, max payload **64 KiB**.
-- Idle connections closed after **120 s** without ping/pong.
+### 1.9 Logging & Monitoring (A09)
+- Log auth events: register, login success/failure, logout, session revocation. Include hashed user id, IP, UA, timestamp.
+- **Never** log: passwords, session tokens, full email addresses (mask: `j***@example.com`).
+- 5xx errors logged with request id; no stack traces in client responses.
 
 ---
 
-## 2. Performance (Latency & Throughput Targets)
+## 2. Performance (Latency Targets)
 
-### 2.1 Backend Latency SLOs (p95, single-node, warm cache)
+### 2.1 API Latency Budgets (p95, server-side)
+| Endpoint | p95 Target | p99 Ceiling |
+|---|---|---|
+| `POST /api/auth/login` | 250 ms (incl. argon2) | 500 ms |
+| `POST /api/auth/register` | 300 ms | 600 ms |
+| `GET /api/habits` | 80 ms | 200 ms |
+| `POST /api/habits` | 100 ms | 250 ms |
+| `PATCH /api/habits/:id` | 100 ms | 250 ms |
+| `POST /api/completions` | 100 ms | 250 ms |
+| `GET /api/habits/:id/completions` | 120 ms | 300 ms |
+| `GET /api/summary/weekly` | 150 ms | 350 ms |
 
-| Endpoint | p50 | p95 | p99 |
-|---|---|---|---|
-| `POST /api/auth/login` | 80 ms | 200 ms | 400 ms |
-| `POST /api/auth/register` | 100 ms | 250 ms | 500 ms |
-| `GET /api/me` | 5 ms | 20 ms | 50 ms |
-| `GET /api/widgets` | 10 ms | 40 ms | 100 ms |
-| `POST /api/widgets` | 15 ms | 50 ms | 120 ms |
-| `PATCH /api/widgets/:id` | 15 ms | 50 ms | 120 ms |
-| `DELETE /api/widgets/:id` | 10 ms | 40 ms | 100 ms |
-| `GET /api/dashboards` | 15 ms | 50 ms | 120 ms |
-| WS message broadcast (server→client) | 10 ms | 50 ms | 100 ms |
+### 2.2 Frontend Web Vitals (mobile, 4G, mid-tier device)
+| Metric | Target | Hard Ceiling |
+|---|---|---|
+| LCP | ≤ 2.0 s | 2.5 s |
+| INP | ≤ 150 ms | 200 ms |
+| CLS | ≤ 0.05 | 0.1 |
+| FCP | ≤ 1.5 s | 2.0 s |
+| TTFB | ≤ 400 ms | 800 ms |
 
-> Argon2 dominates auth latency by design — that is acceptable.
+### 2.3 Bundle Budgets
+- Initial route JS (gzip): **≤ 130 KB** per route.
+- Total page weight on dashboard: **≤ 250 KB** gzip (excl. images).
+- No client-side date library > 15 KB (prefer `date-fns` tree-shaken or native `Intl`).
 
-### 2.2 Frontend Performance Targets
+### 2.4 Database
+- **Required indexes:**
+  - `Session(token)` unique
+  - `Habit(user_id, archived)`
+  - `Completion(habit_id, date)` unique composite
+  - `Completion(user_id, date)`
+- N+1 prohibited: use Prisma `include`/`select` explicitly. Reviewed in PR.
+- Weekly summary query MUST be a single aggregated query, not per-habit loops.
 
-- **Lighthouse Performance score:** ≥ 90 on landing & dashboard (mobile profile).
-- **Core Web Vitals (p75 field/lab):**
-  - LCP ≤ **2.0 s**
-  - INP ≤ **200 ms**
-  - CLS ≤ **0.05**
-- **Time to Interactive:** ≤ 2.5 s on 4G/Moto-G class device.
-- **Initial JS payload:** ≤ **150 KB gzipped** for the landing route; ≤ **250 KB gzipped** for `/dashboard`.
-- **Theme toggle:** zero FOUC — theme MUST be applied via inline `<script>` in `app.html` before first paint.
+### 2.5 Caching
+- `GET /api/habits` and `GET /api/summary/weekly` may set `Cache-Control: private, max-age=0, must-revalidate` with ETag.
+- Static assets: immutable, 1-year max-age via Next.js defaults.
 
-### 2.3 Capacity Targets (MVP, single Docker host, 4 vCPU / 8 GiB)
-
-- Sustained throughput: **≥ 2,000 RPS** on `GET /api/widgets`.
-- Concurrent WS clients: **≥ 1,000** with < 5% CPU per 100 idle connections.
-- Memory ceiling: backend ≤ 512 MiB resident; frontend SSR ≤ 256 MiB.
-
-### 2.4 Performance Engineering Rules
-
-- All SurrealDB queries on `Widget` and `Dashboard` MUST filter by `user_id` and use indexed fields (`user_id`, `id`).
-- N+1 queries are forbidden; aggregate via single SurrealQL query (`FETCH` / `SELECT ... GROUP BY`).
-- WebSocket broadcaster MUST use `tokio::sync::broadcast` (or topic-scoped) — no per-client polling.
-- HTTP responses MUST set `Cache-Control` appropriately:
-  - `GET /api/me`, widgets → `private, no-cache`
-  - Static assets → `public, max-age=31536000, immutable` (hashed filenames)
-- Compression: `br` preferred, `gzip` fallback for responses ≥ 1 KiB.
-- Database connection pool: min 4, max 32, acquire timeout 5 s.
-
-### 2.5 Performance Gates in CI
-
-- `criterion` micro-benchmarks for hot paths (JWT verify, widget serialize) — regression > 15% fails build.
-- Playwright Lighthouse run on PRs touching frontend — score regression > 5 points fails.
+### 2.6 Streak Calculation
+- O(n) over completions for a single habit. Bounded scan (max 365 days lookback) — never full-table scan.
+- Cache current/longest streak in memo per request; invalidate on completion mutation.
 
 ---
 
-## 3. Styling (System Defaults & Design System)
+## 3. Styling (System Defaults)
 
-BentoBoard follows a **system-defaults-first** philosophy: prefer native browser/OS behavior over custom replacements.
+### 3.1 Foundations
+- **Framework:** Tailwind CSS only. No CSS-in-JS, no separate `.module.css` unless justified.
+- **Typography:** System font stack — `ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif`. **No web fonts** in MVP (perf + GDPR).
+- **Color tokens:** Defined in `tailwind.config.ts` under `theme.extend.colors`. Components reference tokens, never raw hex (except validated user habit color).
+- **Spacing:** Tailwind 4px scale only (`p-1`, `p-2`, …). No arbitrary `[13px]` values without comment.
 
-### 3.1 Typography
+### 3.2 Theming (Light/Dark)
+- Implemented via `class="dark"` on `<html>` (Tailwind `darkMode: 'class'`).
+- Theme persisted to `localStorage` key `habitflow:theme` (`light` | `dark` | `system`).
+- Default = `system` (respects `prefers-color-scheme`).
+- All components MUST provide both light and dark variants. Acceptance: visual diff in both modes.
 
-- **Font stack:** system UI fonts only — no web-font downloads.
-  ```css
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
-               Oxygen, Ubuntu, Cantarell, "Helvetica Neue", sans-serif;
-  ```
-- **Mono stack:** `ui-monospace, SFMono-Regular, Menlo, Consolas, monospace`.
-- **Scale:** modular 1.25 ratio; base `16px`. Use `rem` units exclusively (no `px` for type).
+### 3.3 Accessibility (WCAG 2.1 AA)
+- Color contrast ≥ **4.5:1** for body text, **3:1** for large text and UI components — verified for both themes.
+- All interactive elements: focus-visible ring (`focus-visible:ring-2`), keyboard-operable.
+- Touch targets ≥ **44×44 px** (per BuildSpec).
+- Semantic HTML; ARIA only where semantics insufficient.
+- Form fields: associated `<label>`, error messages tied via `aria-describedby`.
 
-### 3.2 Color & Theming
+### 3.4 Responsive Design
+- Mobile-first. Breakpoints: Tailwind defaults (`sm:640`, `md:768`, `lg:1024`, `xl:1280`).
+- Layouts MUST work from **320px** width with no horizontal scroll.
+- Navigation collapses to bottom nav or hamburger below `md`.
 
-- All colors MUST be defined as CSS custom properties in `app.css` under `:root` and `[data-theme="dark"]`.
-- **Forbidden:** hardcoded hex/rgb in components. Use tokens: `--color-bg`, `--color-fg`, `--color-accent`, `--color-muted`, `--color-border`.
-- Dark mode default: respect `prefers-color-scheme` on first visit; persist override in `localStorage`.
-- Contrast: **WCAG 2.1 AA minimum** (4.5:1 text, 3:1 UI). Verified via axe-core in e2e.
-
-### 3.3 Layout & Spacing
-
-- Spacing scale: `4px` base — `--space-1` (4) … `--space-8` (64). No arbitrary margins.
-- Bento grid uses CSS Grid with `grid-template-columns: repeat(auto-fit, minmax(280px, 1fr))`.
-- Mobile breakpoint: `640px`. Tablet: `1024px`. Desktop: `1280px`.
-
-### 3.4 Motion
-
-- Default transition: `150ms ease-out` for color/opacity; `200ms ease-in-out` for layout.
-- MUST honor `@media (prefers-reduced-motion: reduce)` — disable all non-essential animation.
-- No animations longer than **400 ms** on user-initiated actions.
-
-### 3.5 Components
-
-- Use **native HTML elements** first: `<dialog>`, `<details>`, `<input type="...">`, `<button>`. Custom replacements require justification.
-- Forms MUST use native validation attributes (`required`, `minlength`, `pattern`, `type="email"`).
-- Focus states MUST be visible — never `outline: none` without a visible alternative.
-
-### 3.6 Accessibility
-
-- Semantic HTML mandatory (`<nav>`, `<main>`, `<header>`, `<article>`).
-- All interactive elements keyboard-navigable; tab order MUST follow visual flow.
-- ARIA used only when native semantics insufficient.
-- Color MUST never be the sole conveyor of meaning.
+### 3.5 Component Conventions
+- File naming: `PascalCase.tsx`. One component per file.
+- Props typed via TypeScript `interface`. No `any`.
+- Server Components by default; `"use client"` only when needed (forms, theme toggle, completion checkbox).
 
 ---
 
-## 4. Compliance (GDPR / EU
+## 4. Compliance (GDPR / EU-Native)
+
+### 4.1 Lawful Basis & Data Minimization
+- **Lawful basis:** Contract performance (Art. 6(1)(b)) for account & habit data; legitimate interest for security logs.
+- **Data minimization (Art. 5(1)(c)):** Collect only `email`, `password_hash`, `theme_preference`, habit data. **No** analytics, fingerprinting, IP geolocation, or behavioral tracking in MVP.
+
+### 4.2 Hosting & Data Residency
+- **All processing in EU.** Required:
+  - Hosting region: EU (e.g., Vercel `fra1`/`cdg1`, Hetzner DE/FI, Scaleway FR).
+  - Database region: EU only.
+  - No US-based sub-processors (rules out US-region Vercel KV, Supabase US, etc.) without DPA + SCCs review.
+- Document chosen sub-processors in `docs/SUBPROCESSORS.md`.
+
+### 4.3 Cookies & Tracking
+- Only **strictly necessary** cookies in MVP (session cookie). No consent banner required under ePrivacy.
+- **No** third-party analytics, tag managers, fonts (Google Fonts ❌), or CDNs that proxy user IPs outside EU.
+
+### 4.4 User Rights (Art. 15–22)
+MVP must support, even if manually via admin script initially:
+- **Access (Art. 15):** Export user's habits, completions, account data as JSON.
+- **Erasure (Art. 17):** Hard-delete `User`, cascade `Habit`, `Completion`, `Session` rows. Confirm within 30 days.
+- **Rectification (Art. 16):** Email change endpoint (post-MVP acceptable; document

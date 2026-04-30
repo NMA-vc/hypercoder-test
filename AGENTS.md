@@ -1,300 +1,244 @@
 # AGENTS.md
 
-# BentoBoard — Specialist Agent Fleet
+# HabitFlow — Specialist Agent Fleet
 
-This document defines the specialist agent fleet responsible for delivering **BentoBoard**, a real-time dashboard application built on Rust (Axum + Tokio), SurrealDB, and SvelteKit. Each agent owns a clear domain, a defined set of files, and explicit interfaces with sibling agents.
+This document defines the specialist agent fleet responsible for building HabitFlow. Each agent owns a focused vertical of the system and is accountable for the files listed under "Owned Files." Agents coordinate via the task graph defined in the BuildSpec; cross-cutting changes require sign-off from all owning agents.
 
-The fleet is coordinated by the **Lead Architect** (orchestrator) and executes work in three waves matching the task graph (`T01–T15`).
-
----
-
-## Coordination Model
-
-- **Wave 0 (Foundations):** Scaffold, DB, server bootstrap, frontend scaffold.
-- **Wave 1 (Domain features):** Auth, widgets, websockets, dashboard UI, realtime client.
-- **Wave 2 (Polish & ship):** Landing, theming, tests, deployment.
-- **Contracts:** API shapes are defined by the `BackendArchitect` and consumed by the `FrontendArchitect`. WS message schemas are owned by the `RealtimeSpecialist` (shared spec, dual implementation).
-- **Definition of done:** Every agent must produce code that compiles, passes lint/format, and is covered by tests delegated to `QASpecialist`.
+**Stack:** `tectic_v1` (Next.js App Router + TypeScript + Tailwind + Prisma)
+**Coordination model:** Wave-based execution per `task_graph`. Agents within the same wave may execute in parallel; downstream waves block on upstream completion.
 
 ---
 
-## 1. PlatformSpecialist
+## 1. PlatformEngineer
 
-**Role:** Owns the repository skeleton, workspace topology, container orchestration, and developer ergonomics.
+**Role:** Owns project scaffolding, build tooling, and cross-cutting configuration. The first agent to execute and the gatekeeper for all dependency / config changes.
 
 **Capabilities:**
-- Cargo workspace + npm/pnpm workspace setup
-- Docker / docker-compose for SurrealDB + backend + frontend
-- Environment variable conventions and `.env.example`
-- README and onboarding docs
+- Initialize Next.js + TypeScript + Tailwind project
+- Configure tsconfig paths, Tailwind theme tokens (incl. dark mode class strategy), Next.js runtime config
+- Maintain dependency hygiene and lockfile
+- Wire up linting/formatting baselines
 
 **Owned Files:**
-- `Cargo.toml`
-- `backend/Cargo.toml`
-- `frontend/package.json`
-- `docker-compose.yml`
-- `README.md`
+- `package.json`
+- `tsconfig.json`
+- `tailwind.config.ts`
+- `next.config.js`
 
-**Tasks:** `T01`
-
-**Interfaces:** Publishes the canonical project layout consumed by every other agent.
+**Tasks:** `t1`
+**Dependencies:** None (Wave 0 entry point)
 
 ---
 
 ## 2. DBSpecialist
 
-**Role:** Owns SurrealDB connectivity, schema definitions, migrations, and data-access conventions.
+**Role:** Owns the data layer: schema, migrations, and Prisma client conventions. Single source of truth for the `User`, `Habit`, `Completion`, and `Session` models.
 
 **Capabilities:**
-- SurrealDB client setup (connection pool, namespaces, DBs)
-- Schema-full table definitions for `User`, `Session`, `Widget`, `Dashboard`
-- Indexes (e.g., unique `email`, `user_id` lookups)
-- Migration / bootstrap routines
+- Author Prisma schema with proper relations, indices (e.g. `(habit_id, date)` unique), and cascade rules
+- Generate and version migrations
+- Enforce timezone-safe date storage (UTC `DATE` columns) — directly mitigates risk: *"Streak calc errors across timezones"*
+- Provide DB seed scripts for local dev
 
 **Owned Files:**
-- `backend/src/db/mod.rs`
-- `backend/src/db/schema.rs`
+- `prisma/schema.prisma`
+- `prisma/migrations/`
 
-**Tasks:** `T02`
-
-**Interfaces:** Exposes a typed `Db` handle and repository helpers consumed by `AuthSpecialist`, `WidgetSpecialist`, and `RealtimeSpecialist`.
+**Tasks:** `t2`
+**Dependencies:** `t1`
 
 ---
 
-## 3. BackendArchitect
+## 3. AuthSpecialist
 
-**Role:** Owns the Axum HTTP server bootstrap, configuration, global middleware, error handling, and the master router. Acts as the API contract authority.
+**Role:** Owns authentication, session lifecycle, and route protection. Roll-your-own implementation — explicit risk owner for *"Auth security via roll-your-own implementation."*
 
 **Capabilities:**
-- Axum app factory, Tokio runtime configuration
-- Layered middleware (tracing, CORS, auth extractor mounting)
-- Centralized `AppError` / `Result` types
-- Configuration loading (env, defaults, secrets)
+- Implement bcrypt/argon2 password hashing
+- Issue and validate session tokens stored in `Session` table; HttpOnly + Secure + SameSite cookies
+- Build Next.js middleware to gate authenticated routes and redirect unauth users to `/login`
+- Implement `/api/auth/register`, `/api/auth/login`, `/api/auth/logout`
+- Provide `getCurrentUser()` server helper consumed by all downstream API routes
 
 **Owned Files:**
-- `backend/src/main.rs`
-- `backend/src/config.rs`
-- `backend/src/router.rs`
+- `src/lib/auth.ts`
+- `src/middleware.ts`
+- `src/app/api/auth/`
+- `src/app/(auth)/login/page.tsx`
+- `src/app/(auth)/register/page.tsx`
 
-**Tasks:** `T03`
-
-**Interfaces:** Provides `AppState` (db, jwt secret, ws hub handle) and the router into which feature modules mount their nested routers.
+**Tasks:** `t3`, `t4`
+**Dependencies:** `t2`
 
 ---
 
-## 4. AuthSpecialist
+## 4. HabitsAPISpecialist
 
-**Role:** Owns the entire authentication subsystem — registration, login, logout, JWT issuance/verification, password hashing, and the auth middleware/extractor.
+**Role:** Owns the Habit resource: CRUD endpoints with strict ownership enforcement (users may only mutate their own habits).
 
 **Capabilities:**
-- Argon2 password hashing
-- JWT (HS256) signing & verification with configurable secret + expiry
-- Session persistence (revocation on logout)
-- `AuthUser` extractor used by other handlers
+- Implement `GET/POST /api/habits` and `GET/PATCH/DELETE /api/habits/:id`
+- Validate request bodies (zod or equivalent) for `name`, `description`, `color`, `archived`
+- Enforce `habit.user_id === session.user_id` on every mutation
+- Soft-archive semantics rather than hard delete where appropriate
 
 **Owned Files:**
-- `backend/src/auth/mod.rs`
-- `backend/src/auth/handlers.rs`
-- `backend/src/auth/jwt.rs`
-- `backend/src/auth/middleware.rs`
+- `src/app/api/habits/route.ts`
+- `src/app/api/habits/[id]/route.ts`
 
-**API Surface:**
-- `POST /api/auth/register`
-- `POST /api/auth/login`
-- `POST /api/auth/logout`
-- `GET /api/me`
-
-**Tasks:** `T04`
-
-**Interfaces:** Exports `AuthUser` extractor consumed by `WidgetSpecialist` and `RealtimeSpecialist` for protected endpoints.
+**Tasks:** `t5`
+**Dependencies:** `t3`
 
 ---
 
-## 5. WidgetSpecialist
+## 5. CompletionsEngineer
 
-**Role:** Owns the Widget domain — CRUD endpoints, ownership enforcement, and the canonical widget data model on the backend.
+**Role:** Owns daily completion logging and streak computation. Risk owner for *"Streak calc errors across timezones"* and *"Backfill abuse skewing analytics."*
 
 **Capabilities:**
-- Widget CRUD with strict `user_id` scoping
-- Validation of `type`, `title`, `config`, `position`
-- Emits change events to the WS hub on create/update/delete
+- Implement `POST /api/completions` (toggle semantics: creates or deletes), `DELETE /api/completions/:id`, `GET /api/habits/:id/completions`
+- Enforce 30-day backfill window server-side (reject `date` older than `today - 30d` UTC)
+- Enforce uniqueness `(habit_id, date)` to prevent double-logging
+- Compute current streak (resets on missed day) and longest streak (historical max) in `src/lib/streaks.ts`
+- Provide pure, deterministic streak functions covered by unit tests
 
 **Owned Files:**
-- `backend/src/widgets/mod.rs`
-- `backend/src/widgets/handlers.rs`
-- `backend/src/widgets/model.rs`
+- `src/app/api/completions/route.ts`
+- `src/lib/streaks.ts`
 
-**API Surface:**
-- `GET /api/widgets`
-- `POST /api/widgets`
-- `PATCH /api/widgets/:id`
-- `DELETE /api/widgets/:id`
-- `GET /api/dashboards`
-
-**Tasks:** `T05`
-
-**Interfaces:** Calls `RealtimeSpecialist::Hub::broadcast(user_id, event)` after each mutation.
+**Tasks:** `t6`
+**Dependencies:** `t5`
 
 ---
 
-## 6. RealtimeSpecialist
+## 6. FrontendArchitect
 
-**Role:** Owns the WebSocket gateway, the in-process broadcaster (hub), and the wire format for realtime updates. Authoritative source for WS message schemas.
+**Role:** Owns the dashboard shell, habit-management UI, and component contracts consumed by other UI agents. Sets visual + interaction conventions for the app.
 
 **Capabilities:**
-- Authenticated WS upgrade (`WS /ws`) using JWT from query/header
-- Per-user subscription channels via `tokio::sync::broadcast`
-- Heartbeat / ping-pong, graceful disconnect
-- Typed event envelope (e.g., `widget.created`, `widget.updated`, `widget.deleted`)
+- Build dashboard route, habit list rendering, and create/edit forms
+- Define `HabitCard` props consumed by `CompletionToggle` and `WeekGrid`
+- Surface streak data from `src/lib/streaks.ts` on each habit card
+- Coordinate with ThemeSpecialist and UXResponsiveSpecialist on shared component patterns
 
 **Owned Files:**
-- `backend/src/ws/mod.rs`
-- `backend/src/ws/hub.rs`
+- `src/app/dashboard/page.tsx`
+- `src/components/HabitCard.tsx`
+- `src/components/HabitForm.tsx`
 
-**Tasks:** `T06`
-
-**Interfaces:** Exposes `Hub` handle through `AppState`; consumed by `WidgetSpecialist` (publish) and `FrontendRealtimeSpecialist` (subscribe).
+**Tasks:** `t7`
+**Dependencies:** `t5`
 
 ---
 
-## 7. FrontendArchitect
+## 7. LoggingUXSpecialist
 
-**Role:** Owns SvelteKit scaffolding, design tokens, global styles, the API client, and frontend conventions. Authority on frontend module layout.
+**Role:** Owns the daily completion interaction surface, including backfill UI.
 
 **Capabilities:**
-- SvelteKit + Vite configuration, TypeScript strict mode
-- Design token system (colors, spacing, radii, typography) for both themes
-- Typed `fetch` wrapper with auth header injection and error normalization
+- Build `CompletionToggle` (checkbox-style; tap to mark, re-tap to unmark)
+- Build `DatePicker` constrained to last 30 days (UI mirror of backfill window)
+- Optimistic updates with rollback on API failure
+- Ensure 44px+ touch targets (coordinated with UXResponsiveSpecialist)
 
 **Owned Files:**
-- `frontend/svelte.config.js`
-- `frontend/vite.config.ts`
-- `frontend/src/app.css`
-- `frontend/src/lib/theme.ts`
-- `frontend/src/lib/api.ts` *(co-owned with `AuthFrontendSpecialist` for the auth client surface)*
+- `src/components/CompletionToggle.tsx`
+- `src/components/DatePicker.tsx`
 
-**Tasks:** `T07`
-
-**Interfaces:** Provides `api` client and theme tokens consumed by every frontend agent.
+**Tasks:** `t8`
+**Dependencies:** `t6`, `t7`
 
 ---
 
-## 8. AuthFrontendSpecialist
+## 8. AnalyticsSpecialist
 
-**Role:** Owns user-facing auth flows — login, registration pages, the auth store, and token persistence.
+**Role:** Owns the weekly summary feature end-to-end (API + UI).
 
 **Capabilities:**
-- Form handling with validation + error UX
-- JWT storage strategy (httpOnly cookie preferred; localStorage fallback)
-- `auth` Svelte store with derived `isAuthenticated` and `user`
-- Route guards / redirects for protected pages
+- Implement `GET /api/summary/weekly` returning per-habit 7-day completion grid + overall % completion
+- Build `WeekGrid` component (7 cells, completion state per day)
+- Build `/summary` page assembling per-habit grids
+- Ensure summary updates reactively after a completion is logged (revalidation strategy)
 
 **Owned Files:**
-- `frontend/src/routes/login/+page.svelte`
-- `frontend/src/routes/register/+page.svelte`
-- `frontend/src/lib/stores/auth.ts`
-- `frontend/src/lib/api.ts` *(auth-related calls)*
+- `src/app/summary/page.tsx`
+- `src/app/api/summary/weekly/route.ts`
+- `src/components/WeekGrid.tsx`
 
-**Tasks:** `T08`
-
-**Interfaces:** Consumes `AuthSpecialist`'s API; provides the auth store consumed by `DashboardUISpecialist` and `FrontendRealtimeSpecialist`.
+**Tasks:** `t9`
+**Dependencies:** `t6`, `t7`
 
 ---
 
-## 9. DashboardUISpecialist
+## 9. ThemeSpecialist
 
-**Role:** Owns the bento-grid dashboard experience and individual widget rendering.
+**Role:** Owns dark-mode infrastructure and theme persistence.
 
 **Capabilities:**
-- Responsive bento grid (CSS Grid + container queries) adapting mobile ↔ desktop
-- `Widget.svelte` renderer for generic key/value metric widgets
-- Empty/loading/error states
-- Add / edit / delete UX wired to the widgets API
+- Implement `ThemeProvider` (React context, hydration-safe)
+- Implement `ThemeToggle` placed in header
+- Persist user choice in `localStorage`; respect `User.theme_preference` when authenticated
+- Audit Tailwind class usage to guarantee both modes render correctly
 
 **Owned Files:**
-- `frontend/src/routes/dashboard/+page.svelte`
-- `frontend/src/lib/components/BentoGrid.svelte`
-- `frontend/src/lib/components/Widget.svelte`
+- `src/components/ThemeProvider.tsx`
+- `src/components/ThemeToggle.tsx`
 
-**Tasks:** `T09`
-
-**Interfaces:** Consumes widgets API; subscribes to `realtime` store from `FrontendRealtimeSpecialist`.
+**Tasks:** `t10`
+**Dependencies:** `t1`
 
 ---
 
-## 10. FrontendRealtimeSpecialist
+## 10. UXResponsiveSpecialist
 
-**Role:** Owns the WebSocket client, reconnection logic, and the realtime store that feeds reactive UI updates.
+**Role:** Owns global layout, navigation, and responsive behavior from 320px upward.
 
 **Capabilities:**
-- Authenticated WS connection with JWT
-- Exponential backoff reconnection, heartbeat handling
-- Typed event dispatch matching `RealtimeSpecialist`'s schema
-- `realtime` store that merges WS events into local widget state
+- Build `Layout` shell (header, content, footer slots)
+- Build `MobileNav` with collapsing behavior on small screens
+- Maintain `globals.css` (resets, typography, base tokens)
+- Enforce no-horizontal-scroll and 44px touch-target rules across the app
 
 **Owned Files:**
-- `frontend/src/lib/ws.ts`
-- `frontend/src/lib/stores/realtime.ts`
+- `src/components/Layout.tsx`
+- `src/components/MobileNav.tsx`
+- `src/app/globals.css`
 
-**Tasks:** `T10`
-
-**Interfaces:** Mirrors `RealtimeSpecialist`'s wire schema; consumed by `DashboardUISpecialist`.
+**Tasks:** `t11`
+**Dependencies:** `t7`
 
 ---
 
-## 11. MarketingSpecialist
+## 11. QAEngineer
 
-**Role:** Owns the public, unauthenticated surface area — landing page and hero.
+**Role:** Owns the test pyramid: unit coverage for pure logic (esp. streaks) and end-to-end coverage for acceptance criteria.
 
 **Capabilities:**
-- Premium marketing aesthetic, responsive layout
-- CTAs to `/register` and `/login`
-- SEO basics (title, meta, OG tags)
+- Configure Playwright for E2E flows: register → create habit → log completion → backfill → view summary
+- Write unit tests for `src/lib/streaks.ts` covering edge cases (timezone boundaries, missed days, backfill insertion)
+- Write API integration tests for ownership enforcement and 30-day backfill rejection
+- Smoke-test dark mode and mobile viewports
 
 **Owned Files:**
-- `frontend/src/routes/+page.svelte`
-- `frontend/src/lib/components/Hero.svelte`
+- `tests/`
+- `playwright.config.ts`
 
-**Tasks:** `T11`
-
-**Interfaces:** Uses tokens from `FrontendArchitect`.
+**Tasks:** `t12`
+**Dependencies:** `t8`, `t9`
 
 ---
 
-## 12. ThemeSpecialist
+## Execution Waves
 
-**Role:** Owns the dark/light theming system, toggle component, and persistence behavior.
+| Wave | Agents Active | Tasks |
+|------|---------------|-------|
+| 0 | PlatformEngineer → DBSpecialist → AuthSpecialist | t1, t2, t3 |
+| 1 | AuthSpecialist, HabitsAPISpecialist, CompletionsEngineer, FrontendArchitect, LoggingUXSpecialist | t4, t5, t6, t7, t8 |
+| 2 | AnalyticsSpecialist, ThemeSpecialist, UXResponsiveSpecialist, QAEngineer | t9, t10, t11, t12 |
 
-**Capabilities:**
-- `prefers-color-scheme` detection with localStorage override
-- No-flash hydration (SSR-aware initial class)
-- Smooth color transitions across components
-- Token-driven CSS variables
+## Cross-Cutting Conventions
 
-**Owned Files:**
-- `frontend/src/lib/components/ThemeToggle.svelte`
-- `frontend/src/lib/stores/theme.ts`
-
-**Tasks:** `T12`
-
-**Interfaces:** Uses theme tokens defined by `FrontendArchitect`.
-
----
-
-## 13. QASpecialist
-
-**Role:** Owns automated test strategy across backend integration tests and frontend E2E tests.
-
-**Capabilities:**
-- Rust integration tests against a spawned Axum app + ephemeral SurrealDB
-- Auth + Widget happy-path and authorization (negative) tests
-- Playwright E2E covering dashboard load, widget CRUD, realtime updates
-- Test fixtures, factories, and CI-friendly config
-
-**Owned Files:**
-- `backend/tests/auth_test.rs`
-- `backend/tests/widgets_test.rs`
-- `frontend/tests/dashboard.spec.ts`
-- `frontend/playwright.config.ts`
-
-**Tasks:** `T13`, `T
+- **Authorization:** Every API route handler (outside `/api/auth/*`) MUST call `getCurrentUser()` from `src/lib/auth.ts` and reject with 401 on miss. AuthSpecialist owns this contract.
+- **Dates:** All persisted dates are UTC `DATE`. Client-to-server conversion happens at API boundaries. CompletionsEngineer owns this contract.
+- **Ownership checks:** All mutations on `Habit` and `Completion` MUST verify `resource.user_id === session.user_id`. HabitsAPISpecialist + CompletionsEngineer co-own.
+- **Component theming:** New UI components MUST be reviewed against light + dark palettes before merge. ThemeSpecialist signs off.
