@@ -1,63 +1,66 @@
--- Habitly Database Schema
--- Creates tables for habits and completions with RLS policies
+-- Initial schema for Habitly
+-- Creates tables with proper indexes and Row Level Security policies
+-- Ensures user data isolation per GDPR requirements
 
--- Enable necessary extensions
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+-- Enable RLS on auth.users (should already be enabled)
+ALTER TABLE auth.users ENABLE ROW LEVEL SECURITY;
 
 -- Habits table
-CREATE TABLE IF NOT EXISTS habits (
-    id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
-    user_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
-    name text NOT NULL CHECK (length(trim(name)) BETWEEN 1 AND 80),
-    description text CHECK (description IS NULL OR length(description) <= 500),
-    color text NOT NULL DEFAULT '#3b82f6' CHECK (color ~ '^#[0-9A-Fa-f]{6}$'),
-    archived boolean NOT NULL DEFAULT false,
-    created_at timestamptz NOT NULL DEFAULT now()
+CREATE TABLE habits (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  name TEXT NOT NULL CHECK (length(trim(name)) >= 1 AND length(trim(name)) <= 80),
+  description TEXT CHECK (description IS NULL OR length(description) <= 500),
+  color TEXT NOT NULL CHECK (color ~ '^#[0-9A-Fa-f]{6}$'),
+  archived BOOLEAN NOT NULL DEFAULT false,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- Completions table
-CREATE TABLE IF NOT EXISTS completions (
-    id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
-    habit_id uuid NOT NULL REFERENCES habits(id) ON DELETE CASCADE,
-    user_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
-    completed_on date NOT NULL,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    UNIQUE(habit_id, completed_on)
+CREATE TABLE completions (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  habit_id UUID NOT NULL REFERENCES habits(id) ON DELETE CASCADE,
+  user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  completed_on DATE NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(habit_id, completed_on)
 );
 
--- Performance indexes
-CREATE INDEX IF NOT EXISTS idx_habits_user_archived ON habits(user_id, archived);
-CREATE INDEX IF NOT EXISTS idx_completions_habit_date ON completions(habit_id, completed_on DESC);
-CREATE INDEX IF NOT EXISTS idx_completions_user_date ON completions(user_id, completed_on);
+-- Performance indexes per guardrails requirements
+CREATE INDEX idx_habits_user_archived ON habits(user_id, archived);
+CREATE INDEX idx_completions_habit_date ON completions(habit_id, completed_on DESC);
+CREATE INDEX idx_completions_user_date ON completions(user_id, completed_on);
 
--- Enable Row Level Security
+-- Row Level Security policies
 ALTER TABLE habits ENABLE ROW LEVEL SECURITY;
 ALTER TABLE completions ENABLE ROW LEVEL SECURITY;
 
--- RLS Policies for habits table
-CREATE POLICY "Users can view their own habits" ON habits
-    FOR SELECT USING (auth.uid() = user_id);
+-- Habits policies
+CREATE POLICY "Users can view own habits" ON habits
+  FOR SELECT USING (auth.uid() = user_id);
 
-CREATE POLICY "Users can insert their own habits" ON habits
-    FOR INSERT WITH CHECK (auth.uid() = user_id);
+CREATE POLICY "Users can insert own habits" ON habits
+  FOR INSERT WITH CHECK (auth.uid() = user_id);
 
-CREATE POLICY "Users can update their own habits" ON habits
-    FOR UPDATE USING (auth.uid() = user_id)
-    WITH CHECK (auth.uid() = user_id);
+CREATE POLICY "Users can update own habits" ON habits
+  FOR UPDATE USING (auth.uid() = user_id);
 
-CREATE POLICY "Users can delete their own habits" ON habits
-    FOR DELETE USING (auth.uid() = user_id);
+CREATE POLICY "Users can delete own habits" ON habits
+  FOR DELETE USING (auth.uid() = user_id);
 
--- RLS Policies for completions table
-CREATE POLICY "Users can view their own completions" ON completions
-    FOR SELECT USING (auth.uid() = user_id);
+-- Completions policies
+CREATE POLICY "Users can view own completions" ON completions
+  FOR SELECT USING (auth.uid() = user_id);
 
-CREATE POLICY "Users can insert their own completions" ON completions
-    FOR INSERT WITH CHECK (auth.uid() = user_id);
+CREATE POLICY "Users can insert own completions" ON completions
+  FOR INSERT WITH CHECK (auth.uid() = user_id);
 
-CREATE POLICY "Users can update their own completions" ON completions
-    FOR UPDATE USING (auth.uid() = user_id)
-    WITH CHECK (auth.uid() = user_id);
+CREATE POLICY "Users can update own completions" ON completions
+  FOR UPDATE USING (auth.uid() = user_id);
 
-CREATE POLICY "Users can delete their own completions" ON completions
-    FOR DELETE USING (auth.uid() = user_id);
+CREATE POLICY "Users can delete own completions" ON completions
+  FOR DELETE USING (auth.uid() = user_id);
+
+-- Additional constraint: completions.user_id must match habits.user_id
+ALTER TABLE completions ADD CONSTRAINT completions_user_habit_match
+  CHECK (user_id = (SELECT user_id FROM habits WHERE id = habit_id));
