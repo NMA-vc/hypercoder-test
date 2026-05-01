@@ -1,204 +1,161 @@
-# AGENTS.md — DashFlow Analytics Specialist Fleet
+# AGENTS.md — DashCraft Specialist Agent Fleet
 
-**Project:** DashFlow Analytics
-**Stack:** Rust (Tokio/Axum) + SurrealDB + SvelteKit + Mollie
-**Fleet Size:** 12 specialists across 3 waves (40 tasks)
-**Coordination:** Wave-gated execution; agents claim tasks by ID; file ownership is exclusive per task.
+## Project Context
 
----
+**Project:** DashCraft — A high-performance, customizable real-time dashboard platform
+**Stack:** Rust (Axum) backend + SvelteKit frontend + SurrealDB + WebSockets
+**Scale:** 28 tasks across 3 waves, ~1120 minutes estimated
+**Market:** EU-first (GDPR, Mollie/SEPA/iDEAL), freemium SaaS
 
-## Operating Principles (All Agents)
-
-1. **File ownership is exclusive** — never edit files outside your task's `owned_files`.
-2. **Dependencies are gospel** — verify upstream task completion before starting.
-3. **Observability first** — every async boundary gets a `tracing` span; every error gets context.
-4. **Resilience by default** — external calls wrapped in timeout + circuit breaker.
-5. **Multi-tenant safety** — every query scoped by `workspace_id`; no exceptions.
-6. **Commit granularity** — one task = one PR; reference task ID in commit message.
+This document defines the specialist agent fleet responsible for executing the DashCraft build. Each agent owns a domain, a file boundary, and a quality bar. Agents coordinate via the dependency graph in BuildSpec; they do not cross domain lines without an explicit handoff.
 
 ---
 
-## Wave 0 — Foundation (Tasks T01–T07)
+## Fleet Overview
 
-### `agent.platform-bootstrapper`
-**Role:** Owns the Rust project skeleton, dependency graph, and environment scaffolding.
-**Tasks:** T01
-**Capabilities:**
-- Cargo workspace layout with feature flags
-- Tokio runtime configuration (multi-threaded scheduler tuning)
-- Axum + Tower middleware baseline
-- `.env` schema with `dotenvy` loading
-- Workspace-level lints (`clippy::pedantic`, `deny(unsafe_code)`)
-**Hand-off:** Provides the module tree all other Rust agents extend.
-
-### `agent.persistence-engineer`
-**Role:** SurrealDB schema authority and connection pool owner.
-**Tasks:** T02, T07
-**Capabilities:**
-- SurrealDB v2.x schemafull table design
-- `surrealdb` Rust client connection pooling with health probes
-- SCHEMAFULL definitions for User, Workspace, Dashboard with `DEFINE FIELD` constraints
-- Migration discipline via versioned `.sql` files
-- Index strategy for tenant-scoped queries (`workspace_id` first)
-**Constraints:** Must expose typed `Repo<T>` traits — no raw query strings leak past `src/db/`.
-
-### `agent.observability-engineer`
-**Role:** Telemetry spine for the entire backend.
-**Tasks:** T03
-**Capabilities:**
-- `tracing` + `tracing-subscriber` with JSON formatter for prod, pretty for dev
-- OpenTelemetry-compatible span exporters
-- Correlation ID propagation across async tasks
-- Structured log fields (`workspace_id`, `user_id`, `request_id`)
-**Hand-off:** All subsequent agents inject the `Tracer` handle from `src/telemetry.rs`.
-
-### `agent.resilience-engineer`
-**Role:** Failure-mode specialist — rate limiting, circuit breaking, timeouts.
-**Tasks:** T04, T05, T06
-**Capabilities:**
-- Token-bucket rate limiter as Tower layer (per-IP and per-workspace)
-- Circuit breaker state machine (closed/open/half-open) with `tracing` events
-- Generic `with_timeout<F>` wrapper using `tokio::time::timeout`
-- Backpressure-aware concurrency limits
-**Output Contract:** Reusable middleware + utility types — consumed by every handler in Wave 1.
+| Agent | Domain | Wave(s) | Owned Tasks |
+|---|---|---|---|
+| `rust-foundation` | Cargo workspace, config, telemetry, errors | 0 | T02 |
+| `data-modeler` | SurrealDB schema, models, migrations | 0 | T01 |
+| `auth-engineer` | JWT, sessions, password hashing, auth middleware | 1 | T03, T05 |
+| `resilience-engineer` | Rate limiting, circuit breakers, timeouts | 1 | T04 |
+| `backend-services` | Domain service layer (dashboard, widget) | 1 | T06, T07 |
+| `backend-api` | Axum handlers, routing, request validation | 1 | T08, T09, T13 |
+| `realtime-engineer` | WebSocket lifecycle, connection registry, fan-out | 1 | T10 |
+| `payments-engineer` | Mollie integration, subscription state sync | 1 | T11 |
+| `compliance-engineer` | GDPR, audit logging, data export/deletion | 1 | T12, T26 |
+| `frontend-foundation` | Theme system, design tokens, base UI primitives | 2 | T14, T25 |
+| `frontend-resilience` | Error boundaries, toasts, API client, retry/CB | 2 | T15, T17 |
+| `frontend-auth` | Login/register flows, auth stores | 2 | T16 |
+| `dashboard-ux` | Bento grid, layout engine, dashboard CRUD UI | 2 | T18, T23 |
+| `widget-ux` | Widget components, configuration UI | 2 | T19 |
+| `realtime-client` | WS client, reconnection, connection status | 2 | T20 |
+| `interaction-engineer` | Drag-and-drop, touch handlers, mobile responsive | 2 | T21, T27 |
+| `navigation-engineer` | Sidebar, header, app shell, routing | 2 | T22 |
+| `billing-ux` | Pricing, subscription status, billing portal UI | 2 | T24 |
+| `offline-engineer` | Service worker, cache strategy, offline indicator | 2 | T28 |
 
 ---
 
-## Wave 1 — Backend Services (Tasks T08–T20)
+## Wave 0 — Foundation Agents
 
-### `agent.identity-engineer`
-**Role:** Authentication, sessions, and credential security.
-**Tasks:** T08, T17
+### `rust-foundation`
+**Role:** Establishes the Rust project skeleton and cross-cutting infrastructure that every backend agent depends on.
+**Owned Files:** `Cargo.toml`, `src/lib.rs`, `src/config.rs`, `src/telemetry.rs`, `src/error.rs`
 **Capabilities:**
-- Argon2id password hashing (parameters tuned for ~250ms)
-- JWT (HS256) issuance + refresh token rotation
-- Session store backed by SurrealDB with TTL cleanup
-- Login rate-limit hooks via `agent.resilience-engineer`'s middleware
-**Threat Model:** Credential stuffing, JWT replay, session fixation.
+- Configures Cargo workspace with Axum, Tokio, SurrealDB driver, `tracing`, `tracing-subscriber`, `serde`, `thiserror`
+- Implements layered config (env → file → defaults) via `figment` or `config`
+- Sets up structured `tracing` with JSON output for production, pretty for dev
+- Defines a unified `AppError` enum implementing `IntoResponse` for Axum
+- Exports a clean `lib.rs` surface so binaries and tests share the same core
+**Quality Bar:** Zero `unwrap()` in non-test code; all errors typed; telemetry spans on every public boundary.
+**Hands off to:** all backend agents in Wave 1.
 
-### `agent.tenancy-engineer`
-**Role:** Multi-tenant boundary enforcement and workspace lifecycle.
-**Tasks:** T09, T16
+### `data-modeler`
+**Role:** Owns the persistence schema and Rust struct representations of all 10 domain entities.
+**Owned Files:** `src/db/mod.rs`, `src/db/models.rs`, `src/db/migrations.rs`, `src/models/*.rs` (10 files)
 **Capabilities:**
-- Tenant-resolution middleware (extract workspace from path/JWT, attach to request extensions)
-- Workspace CRUD with owner/member role checks
-- Invitation tokens (signed, single-use, TTL-bound) with email dispatch hook
-**Critical Invariant:** No service layer below this agent ever queries without a `WorkspaceContext`.
-
-### `agent.product-api-engineer`
-**Role:** Core product endpoints — dashboards, widgets, data sources, metrics, analytics.
-**Tasks:** T10, T12, T13, T15
-**Capabilities:**
-- RESTful handler design with typed request/response DTOs
-- Query aggregation pipelines for metrics with filter pushdown to SurrealDB
-- Data source credential encryption-at-rest (AES-256-GCM with per-workspace KEK)
-- Analytics rollups (hourly/daily) computed via background tasks
-**Dependencies:** Consumes resilience layer for all external data source connections.
-
-### `agent.realtime-engineer`
-**Role:** WebSocket transport and live update fan-out.
-**Tasks:** T11
-**Capabilities:**
-- Axum WebSocket upgrade handling
-- Per-dashboard subscription registry (`DashMap<DashboardId, Vec<ConnectionHandle>>`)
-- Heartbeat + reconnection protocol
-- SurrealDB LIVE query subscription bridging to WS frames
-**Performance Target:** 10k concurrent connections per node.
-
-### `agent.billing-engineer`
-**Role:** Mollie subscription integration and webhook integrity.
-**Tasks:** T14
-**Capabilities:**
-- Mollie API client with circuit breaker (Mollie outage ≠ user-facing error)
-- Webhook signature verification + idempotency keys
-- Subscription state machine (trialing → active → past_due → cancelled)
-- Tier enforcement hooks (downgrade on payment failure after grace period)
-**Compliance:** No PAN data ever touches our database — Mollie tokens only.
-
-### `agent.compliance-engineer`
-**Role:** Audit trail and GDPR plumbing.
-**Tasks:** T18
-**Capabilities:**
-- Append-only audit log (workspace_id, actor, action, resource, IP, UA)
-- Structured event taxonomy (auth.login, dashboard.update, data.export, etc.)
-- Retention policy enforcement (configurable per workspace)
-**Hand-off:** All other Wave 1 agents emit audit events via `audit::log!()` macro.
-
-### `agent.server-integrator`
-**Role:** Composes the HTTP server, route table, and middleware stack.
-**Tasks:** T19, T20
-**Capabilities:**
-- Axum router composition with nested workspace routes
-- CORS policy (strict allowlist; credentials true for app domain)
-- Health endpoints: `/health/live` (process), `/health/ready` (DB+deps)
-- Graceful shutdown (drain WS, flush logs, close pool)
-**Final Wave 1 Step:** Smoke tests before Wave 2 unblocks.
+- Designs SurrealDB schema with explicit `DEFINE TABLE` / `DEFINE FIELD` statements (schema-full where data integrity matters)
+- Models: User, Dashboard, Widget, DataSource, Subscription, Session, WebSocketConnection, AuditLog, ApiKey, SharedDashboard
+- Implements connection pooling and a `Db` handle injected via Axum state
+- Writes idempotent migrations with version tracking
+- Provides `From`/`TryFrom` between DB rows and domain models; never leaks DB types past the model boundary
+**Quality Bar:** Every field has a documented purpose; indexes defined for all foreign-key lookups; encryption-at-rest fields flagged.
+**Risk Watch:** SurrealDB pre-1.0 maturity — abstract DB access behind a trait so a Postgres swap remains feasible.
 
 ---
 
-## Wave 2 — Frontend (Tasks T21–T40)
+## Wave 1 — Backend Agents
 
-### `agent.frontend-platform-engineer`
-**Role:** SvelteKit foundation, build pipeline, and resilience primitives.
-**Tasks:** T21, T22, T23, T24, T39
+### `auth-engineer`
+**Role:** Owns identity, session lifecycle, and the authenticated-request contract.
+**Owned Files:** `src/auth/{mod,service,jwt,password}.rs`, `src/middleware/auth.rs`, `src/handlers/auth.rs`, `src/routes/auth.rs`
 **Capabilities:**
-- SvelteKit + Vite + TypeScript strict mode
-- Tailwind config aligned to design tokens
-- Global error boundary + toast system + skeleton/empty/offline fallback components
-- Retry utilities with exponential backoff + offline queue (IndexedDB-backed)
-**Hand-off:** Every UI agent below uses these primitives — no custom error/toast paths.
+- Argon2id password hashing with sane parameters
+- JWT issuance (HS256 or EdDSA) with short-lived access + refresh token pattern
+- Session record stored in SurrealDB for revocation
+- Axum extractor `AuthUser` that fails closed on missing/invalid tokens
+- `/auth/login` and `/auth/register` with rate-limited brute-force protection (coordinates with `resilience-engineer`)
+**Quality Bar:** Constant-time comparisons; no PII in logs; tokens scoped to specific permissions.
 
-### `agent.design-system-engineer`
-**Role:** Premium visual language — components, theming, motion.
-**Tasks:** T27, T36, T37
+### `resilience-engineer`
+**Role:** Cross-cutting middleware that protects every endpoint from abuse and cascading failures.
+**Owned Files:** `src/middleware/{rate_limit,circuit_breaker,timeout,mod}.rs`
 **Capabilities:**
-- Headless component primitives (Button, Card, Input) with variant API
-- CSS custom properties for dark/light themes; `prefers-color-scheme` + manual override
-- Mobile-first responsive nav (sidebar collapse, mobile drawer)
-- Animation utilities (Svelte transitions, FLIP, spring physics) — the "design signature"
-**Aesthetic Bar:** Screenshot-worthy by default.
+- Tower-layer rate limiter keyed by user_id and IP (separate buckets for auth vs. general)
+- Circuit breaker around outbound calls (Mollie, future data sources)
+- Per-route timeout middleware with sensible defaults (5s API, 30s WS handshake)
+- Emits metrics/spans for every rejection so abuse is observable
+**Quality Bar:** Middleware is composable, ordered intentionally, and exposes config via `AppConfig`.
 
-### `agent.app-experience-engineer`
-**Role:** User-facing flows — auth, workspaces, dashboards, widgets, sharing.
-**Tasks:** T25, T26, T28, T29, T38
+### `backend-services`
+**Role:** Pure business logic for dashboards and widgets — no HTTP, no DB SQL leaking out.
+**Owned Files:** `src/services/{mod,dashboard,widget}.rs`
 **Capabilities:**
-- Auth pages with form validation + protected route guards via `hooks.server.ts`
-- Workspace selector + tenant-aware layout
-- Bento-grid layout engine with drag/resize (pointer events, keyboard a11y)
-- Widget plugin system (Chart, Metric, Table) with config panels
-- Public share tokens + PNG/PDF export
-**UX Discipline:** Optimistic updates everywhere a user clicks.
+- Enforces freemium limits (3 dashboards / 10 widgets) at the service boundary
+- CRUD with authorization checks (owner-only, with shared-dashboard exceptions)
+- Layout config validation for bento grid integrity
+- Returns domain errors that handlers translate to HTTP codes
+**Quality Bar:** 100% of authorization decisions live here, never in handlers.
 
-### `agent.data-experience-engineer`
-**Role:** Data source UIs, query builder, billing, analytics, members.
-**Tasks:** T31, T32, T33, T34, T35
+### `backend-api`
+**Role:** HTTP surface — Axum handlers, route composition, request/response DTOs, and the main server bootstrap.
+**Owned Files:** `src/handlers/{dashboard,widget}.rs`, `src/routes/{dashboard,widget,mod}.rs`, `src/main.rs`, `src/server.rs`
 **Capabilities:**
-- Data source connection wizard with credential masking
-- Visual query builder (filters, group-by, time range) compiling to backend metric queries
-- Mollie checkout redirect flow + subscription management UI
-- Workspace analytics charts + activity feed
-- Member invite/list/role management
-**Reuses:** Chart components from `agent.app-experience-engineer`.
+- Implements all dashboard and widget endpoints from the API surface
+- Request validation via `validator` crate
+- Wires services, middleware stack, CORS, and graceful shutdown
+- Mounts WebSocket routes from `realtime-engineer`
+- Health and readiness endpoints for DigitalOcean App Platform
+**Quality Bar:** Handlers are <30 lines each; every route emits a tracing span with user_id and resource_id.
 
-### `agent.realtime-client-engineer`
-**Role:** WebSocket client, caching, and live state synchronization.
-**Tasks:** T30, T40
+### `realtime-engineer`
+**Role:** WebSocket transport for live widget updates.
+**Owned Files:** `src/websocket/{mod,connection,handler}.rs`, `src/services/websocket.rs`
 **Capabilities:**
-- Reconnecting WebSocket client with backoff + connection status store
-- Optimistic update layer with rollback on server reject
-- Cache store with TTL + tag-based invalidation
-- Conflict resolution for concurrent dashboard edits (last-write-wins with toast warning)
-**Dependencies:** Pairs tightly with `agent.realtime-engineer` (Wave 1) on protocol.
+- Per-connection task with heartbeat ping/pong
+- Subscription model: clients subscribe to dashboard_id channels
+- Backpressure-aware fan-out (drop slow consumers, never block the producer)
+- Authenticated handshake reusing `AuthUser` extractor
+- Persists active connections in `WebSocketConnection` table for multi-instance routing later
+**Quality Bar:** Memory bounded per connection; scale plan documented (sticky sessions or pub/sub bus).
+
+### `payments-engineer`
+**Role:** Mollie subscription integration and entitlement reconciliation.
+**Owned Files:** `src/services/{subscription,payment}.rs`, `src/external/mollie.rs`
+**Capabilities:**
+- Mollie API client (customers, subscriptions, mandates) with retries via `resilience-engineer`'s circuit breaker
+- Webhook handler that is the source of truth for subscription state
+- Reconciliation job that catches missed webhooks (cron-style)
+- Entitlement check helper used by `backend-services` for Pro/Team gating
+- Plans: Free / Pro €19 / Team €49 with 14-day trial
+**Quality Bar:** Idempotent webhook processing keyed by Mollie event ID; double-billing is impossible.
+
+### `compliance-engineer` (Backend half)
+**Role:** GDPR rights implementation and audit trail.
+**Owned Files:** `src/services/{gdpr,audit}.rs`
+**Capabilities:**
+- Data export endpoint producing a complete user JSON archive
+- Hard-delete cascade with audit record retention (delete data, keep "user X deleted at Y")
+- Append-only audit log writes from auth, payment, and dashboard services
+- Data retention policy enforcement (background job)
+**Quality Bar:** Export completes within 24h SLA; deletion is verifiable and tested.
 
 ---
 
-## Coordination Protocol
+## Wave 2 — Frontend Agents
 
-| Stage | Gate Criteria |
-|---|---|
-| Wave 0 → 1 | T01–T07 merged; CI green; SurrealDB schema applied in dev |
-| Wave 1 → 2 | T19/T20 merged; `/health/ready` returns 200; OpenAPI spec published |
-| Wave 2 → Release | All 40 tasks merged; e2e suite green; Lighthouse ≥ 90 mobile |
+### `frontend-foundation`
+**Role:** Design system bedrock — tokens, theme switching, and primitive components everyone else composes.
+**Owned Files:** `src/lib/styles/{global,variables}.css`, `src/lib/stores/theme.ts`, `src/lib/components/ui/{Button,Input,Card,Modal,Skeleton,LoadingSpinner,ProgressBar}.svelte`, `src/lib/stores/loading.ts`
+**Capabilities:**
+- CSS custom properties for color/spacing/typography scales (light + dark)
+- Theme store persisted to localStorage, hydrated SSR-safely
+- Premium aesthetic: consistent 8px spacing grid, type scale, motion tokens (cubic-bezier easing)
+- Accessible primitives (focus rings, ARIA, keyboard nav)
+- Skeleton/loading primitives for use across all data-fetching components
+**Quality Bar:** Zero hardcoded colors outside variables.css; all primitives keyboard-navigable.
 
-**Conflict Resolution:** Lead architect arbitrates cross-agent file disputes within 1 business day.
-**Escalation Triggers:** Any task exceeding 1.5× estimated duration, any cross-wave dependency violation, any new external service introduction.
+### `frontend-resilience`
+**Role:** Error containment and the API transport layer.
+**Owned Files:** `src/lib/components/{ErrorBoundary,ui/Toast,ui/ErrorFallback}.svelte`, `src/lib/stores/{errors,api-status}.ts`, `src/lib/utils/error-handler.ts`, `src/lib/api/{client,circuit-breaker}.ts`,
