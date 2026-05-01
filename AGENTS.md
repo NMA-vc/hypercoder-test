@@ -1,264 +1,204 @@
-# AGENTS.md — Habitly Specialist Fleet
+# AGENTS.md — DashFlow Analytics Specialist Fleet
 
-This document defines the specialist agent fleet responsible for delivering Habitly per the BuildSpec. Each agent owns a discrete slice of the codebase, has clearly scoped capabilities, and coordinates with peers via the task graph dependencies.
-
-Stack: Next.js (App Router) + Supabase + Tailwind/shadcn + Vercel.
-
----
-
-## Coordination Model
-
-- **Waves** drive scheduling: Wave 0 (foundations) → Wave 1 (auth/data/APIs) → Wave 2 (UI/polish/tests).
-- Each agent edits **only its owned files**. Cross-cutting concerns are negotiated by the LeadArchitect.
-- All DB-touching agents must use the `lib/supabase/*` clients and respect RLS — no service-role usage in user paths.
-- All dates use **user-local `completed_on`** to avoid timezone bugs in streaks.
+**Project:** DashFlow Analytics
+**Stack:** Rust (Tokio/Axum) + SurrealDB + SvelteKit + Mollie
+**Fleet Size:** 12 specialists across 3 waves (40 tasks)
+**Coordination:** Wave-gated execution; agents claim tasks by ID; file ownership is exclusive per task.
 
 ---
 
-## 1. LeadArchitect (Coordinator)
+## Operating Principles (All Agents)
 
-**Role:** Owns the BuildSpec, task graph, conventions, and cross-agent consistency. Resolves API contracts and shared type shapes.
+1. **File ownership is exclusive** — never edit files outside your task's `owned_files`.
+2. **Dependencies are gospel** — verify upstream task completion before starting.
+3. **Observability first** — every async boundary gets a `tracing` span; every error gets context.
+4. **Resilience by default** — external calls wrapped in timeout + circuit breaker.
+5. **Multi-tenant safety** — every query scoped by `workspace_id`; no exceptions.
+6. **Commit granularity** — one task = one PR; reference task ID in commit message.
 
+---
+
+## Wave 0 — Foundation (Tasks T01–T07)
+
+### `agent.platform-bootstrapper`
+**Role:** Owns the Rust project skeleton, dependency graph, and environment scaffolding.
+**Tasks:** T01
 **Capabilities:**
-- Maintain task ordering, unblock waves, mediate file-ownership disputes.
-- Approve API surface contracts before downstream agents consume them.
-- Final arbiter on data-model and RLS shape.
+- Cargo workspace layout with feature flags
+- Tokio runtime configuration (multi-threaded scheduler tuning)
+- Axum + Tower middleware baseline
+- `.env` schema with `dotenvy` loading
+- Workspace-level lints (`clippy::pedantic`, `deny(unsafe_code)`)
+**Hand-off:** Provides the module tree all other Rust agents extend.
 
-**Owned files:** `AGENTS.md`, `BUILDSPEC.md` (if produced), top-level conventions docs.
-
-**Coordinates with:** All agents.
-
----
-
-## 2. ScaffoldSpecialist
-
-**Role:** Bootstraps the Next.js app, Tailwind, and shadcn/ui. Establishes baseline layout and global styles.
-
+### `agent.persistence-engineer`
+**Role:** SurrealDB schema authority and connection pool owner.
+**Tasks:** T02, T07
 **Capabilities:**
-- Initialize Next.js App Router project, TypeScript, ESLint.
-- Configure Tailwind, shadcn `components.json`, design tokens, font stack.
-- Provide root `app/layout.tsx` shell that ThemeSpecialist later wraps.
+- SurrealDB v2.x schemafull table design
+- `surrealdb` Rust client connection pooling with health probes
+- SCHEMAFULL definitions for User, Workspace, Dashboard with `DEFINE FIELD` constraints
+- Migration discipline via versioned `.sql` files
+- Index strategy for tenant-scoped queries (`workspace_id` first)
+**Constraints:** Must expose typed `Repo<T>` traits — no raw query strings leak past `src/db/`.
 
-**Owned files (T01):**
-- `package.json`
-- `next.config.js`
-- `tailwind.config.ts`
-- `app/layout.tsx`
-- `app/globals.css`
-- `components.json`
-
-**Wave:** 0  
-**Coordinates with:** ThemeSpecialist (root layout integration), FrontendArchitect.
-
----
-
-## 3. PlatformSpecialist (Supabase Wiring)
-
-**Role:** Provides typed Supabase clients (browser + server) and environment configuration.
-
+### `agent.observability-engineer`
+**Role:** Telemetry spine for the entire backend.
+**Tasks:** T03
 **Capabilities:**
-- Create SSR-safe and client-side Supabase factories.
-- Define `.env.example` for `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`.
-- Export shared `Database` types (generated or hand-rolled).
+- `tracing` + `tracing-subscriber` with JSON formatter for prod, pretty for dev
+- OpenTelemetry-compatible span exporters
+- Correlation ID propagation across async tasks
+- Structured log fields (`workspace_id`, `user_id`, `request_id`)
+**Hand-off:** All subsequent agents inject the `Tracer` handle from `src/telemetry.rs`.
 
-**Owned files (T02):**
-- `lib/supabase/client.ts`
-- `lib/supabase/server.ts`
-- `.env.example`
-
-**Wave:** 0  
-**Coordinates with:** DBSpecialist, AuthSpecialist, APISpecialist.
-
----
-
-## 4. DBSpecialist
-
-**Role:** Owns the Postgres schema, indexes, and Row-Level Security (RLS) policies in Supabase.
-
+### `agent.resilience-engineer`
+**Role:** Failure-mode specialist — rate limiting, circuit breaking, timeouts.
+**Tasks:** T04, T05, T06
 **Capabilities:**
-- Define `habits` and `completions` tables per data model.
-- Enforce `unique(habit_id, completed_on)` and FK cascade rules.
-- Author RLS so users can only read/write their own rows (mitigates risk #2).
-- Add indexes for `(user_id, archived)` and `(habit_id, completed_on desc)`.
-
-**Owned files (T03):**
-- `supabase/migrations/0001_init.sql`
-
-**Wave:** 0  
-**Coordinates with:** PlatformSpecialist, APISpecialist.
+- Token-bucket rate limiter as Tower layer (per-IP and per-workspace)
+- Circuit breaker state machine (closed/open/half-open) with `tracing` events
+- Generic `with_timeout<F>` wrapper using `tokio::time::timeout`
+- Backpressure-aware concurrency limits
+**Output Contract:** Reusable middleware + utility types — consumed by every handler in Wave 1.
 
 ---
 
-## 5. AuthSpecialist
+## Wave 1 — Backend Services (Tasks T08–T20)
 
-**Role:** Implements Supabase email/password auth, session persistence, route protection, and password recovery.
-
+### `agent.identity-engineer`
+**Role:** Authentication, sessions, and credential security.
+**Tasks:** T08, T17
 **Capabilities:**
-- Build login, signup, forgot/reset password flows and server actions.
-- Implement Next.js `middleware.ts` to redirect unauthenticated users from protected routes to `/login`.
-- Handle Supabase email confirmation callback and logout.
-- Expose `/api/me` for current user profile.
+- Argon2id password hashing (parameters tuned for ~250ms)
+- JWT (HS256) issuance + refresh token rotation
+- Session store backed by SurrealDB with TTL cleanup
+- Login rate-limit hooks via `agent.resilience-engineer`'s middleware
+**Threat Model:** Credential stuffing, JWT replay, session fixation.
 
-**Owned files:**
-- T04: `app/login/page.tsx`, `app/signup/page.tsx`, `app/auth/actions.ts`, `middleware.ts`
-- T12: `app/api/auth/logout/route.ts`
-- T13: `app/auth/callback/route.ts`
-- T24: `app/forgot-password/page.tsx`, `app/reset-password/page.tsx`
-- T25: `app/api/auth/reset-password/route.ts`
-- T26: `app/api/me/route.ts`
-
-**Wave:** 1  
-**Coordinates with:** PlatformSpecialist, FrontendArchitect (protected layout).
-
----
-
-## 6. APISpecialist (Habits & Completions)
-
-**Role:** Owns all REST route handlers and shared domain logic for habits, completions, archiving, and streaks.
-
+### `agent.tenancy-engineer`
+**Role:** Multi-tenant boundary enforcement and workspace lifecycle.
+**Tasks:** T09, T16
 **Capabilities:**
-- Implement habits CRUD, toggle, archive/unarchive, completions list.
-- Encapsulate query logic in `lib/habits.ts` and streak math in `lib/streaks.ts` (current + longest, timezone-safe via `completed_on`).
-- Validate inputs (zod recommended) and return typed JSON.
-- Return 401 for unauth, 403 for cross-user access (defense-in-depth on top of RLS).
+- Tenant-resolution middleware (extract workspace from path/JWT, attach to request extensions)
+- Workspace CRUD with owner/member role checks
+- Invitation tokens (signed, single-use, TTL-bound) with email dispatch hook
+**Critical Invariant:** No service layer below this agent ever queries without a `WorkspaceContext`.
 
-**Owned files:**
-- T05: `app/api/habits/route.ts`, `app/api/habits/[id]/route.ts`, `lib/habits.ts`
-- T06: `app/api/habits/[id]/toggle/route.ts`, `app/api/habits/[id]/streak/route.ts`, `lib/streaks.ts`
-- T27: `app/api/habits/[id]/archive/route.ts`
-- T28: `app/api/habits/[id]/completions/route.ts`
-
-**Wave:** 1  
-**Coordinates with:** DBSpecialist (schema), AnalyticsSpecialist (summary endpoint reuses `lib/habits.ts`).
-
----
-
-## 7. AnalyticsSpecialist (Weekly Summary)
-
-**Role:** Builds the 7-day completion matrix endpoint and the summary page UI.
-
+### `agent.product-api-engineer`
+**Role:** Core product endpoints — dashboards, widgets, data sources, metrics, analytics.
+**Tasks:** T10, T12, T13, T15
 **Capabilities:**
-- Aggregate last 7 days × active habits into a matrix payload.
-- Compute weekly completion percentage per habit.
-- Render `WeeklyGrid` with accessible color cues for completed days.
+- RESTful handler design with typed request/response DTOs
+- Query aggregation pipelines for metrics with filter pushdown to SurrealDB
+- Data source credential encryption-at-rest (AES-256-GCM with per-workspace KEK)
+- Analytics rollups (hourly/daily) computed via background tasks
+**Dependencies:** Consumes resilience layer for all external data source connections.
 
-**Owned files (T08):**
-- `app/api/summary/weekly/route.ts`
-- `app/(app)/summary/page.tsx`
-- `components/weekly-grid.tsx`
-
-**Wave:** 2  
-**Coordinates with:** APISpecialist (reuses `lib/habits.ts`), FrontendArchitect.
-
----
-
-## 8. FrontendArchitect (App Shell & Habit UI)
-
-**Role:** Owns the authenticated app shell, dashboard, and all habit-management pages.
-
+### `agent.realtime-engineer`
+**Role:** WebSocket transport and live update fan-out.
+**Tasks:** T11
 **Capabilities:**
-- Compose protected `(app)` route group layout with auth guard, header, and nav.
-- Build dashboard with habit list, optimistic toggle, and inline create.
-- Implement habit list, new/edit, detail (with streaks), and archived views.
-- Ensure 375px-min layout, 44px+ touch targets.
+- Axum WebSocket upgrade handling
+- Per-dashboard subscription registry (`DashMap<DashboardId, Vec<ConnectionHandle>>`)
+- Heartbeat + reconnection protocol
+- SurrealDB LIVE query subscription bridging to WS frames
+**Performance Target:** 10k concurrent connections per node.
 
-**Owned files:**
-- T07: `app/(app)/dashboard/page.tsx`, `components/habit-card.tsx`, `components/habit-form.tsx`
-- T11: `app/page.tsx` (root redirect)
-- T14: `app/(app)/layout.tsx`
-- T15: `app/(app)/habits/new/page.tsx`
-- T16: `app/(app)/habits/[id]/edit/page.tsx`
-- T17: `app/(app)/habits/[id]/page.tsx`
-- T18: `app/(app)/habits/page.tsx`
-- T19: `app/(app)/habits/archived/page.tsx`
-- T20: `app/(app)/settings/page.tsx`
-- T23: `app/(app)/loading.tsx`, `app/(app)/dashboard/loading.tsx`
-
-**Wave:** 1–2  
-**Coordinates with:** AuthSpecialist (guard), APISpecialist (data), ThemeSpecialist, UIKitSpecialist.
-
----
-
-## 9. ThemeSpecialist (Dark Mode & Responsive Polish)
-
-**Role:** Owns theming, system-preference detection, and responsive navigation chrome.
-
+### `agent.billing-engineer`
+**Role:** Mollie subscription integration and webhook integrity.
+**Tasks:** T14
 **Capabilities:**
-- Provide `ThemeProvider` (next-themes pattern) with localStorage persistence.
-- Build accessible theme toggle and primary nav.
-- Build mobile bottom nav + header that collapse appropriately.
+- Mollie API client with circuit breaker (Mollie outage ≠ user-facing error)
+- Webhook signature verification + idempotency keys
+- Subscription state machine (trialing → active → past_due → cancelled)
+- Tier enforcement hooks (downgrade on payment failure after grace period)
+**Compliance:** No PAN data ever touches our database — Mollie tokens only.
 
-**Owned files:**
-- T09: `components/theme-provider.tsx`, `components/theme-toggle.tsx`, `components/nav.tsx`
-- T29: `components/mobile-nav.tsx`, `components/header.tsx`
-
-**Wave:** 2  
-**Coordinates with:** ScaffoldSpecialist (root layout), FrontendArchitect (app shell).
-
----
-
-## 10. UIKitSpecialist (Shared Components)
-
-**Role:** Builds reusable UX primitives consumed across pages.
-
+### `agent.compliance-engineer`
+**Role:** Audit trail and GDPR plumbing.
+**Tasks:** T18
 **Capabilities:**
-- `EmptyState` for zero-habit dashboards and archived lists.
-- `ConfirmDialog` for destructive actions (delete/archive).
-- Built atop shadcn primitives, fully accessible (focus trap, ESC close).
+- Append-only audit log (workspace_id, actor, action, resource, IP, UA)
+- Structured event taxonomy (auth.login, dashboard.update, data.export, etc.)
+- Retention policy enforcement (configurable per workspace)
+**Hand-off:** All other Wave 1 agents emit audit events via `audit::log!()` macro.
 
-**Owned files (T30):**
-- `components/empty-state.tsx`
-- `components/confirm-dialog.tsx`
-
-**Wave:** 2  
-**Coordinates with:** FrontendArchitect, AnalyticsSpecialist.
-
----
-
-## 11. ReliabilitySpecialist (Errors & Not Found)
-
-**Role:** Owns global error boundaries and 404 surfaces.
-
+### `agent.server-integrator`
+**Role:** Composes the HTTP server, route table, and middleware stack.
+**Tasks:** T19, T20
 **Capabilities:**
-- Implement `not-found.tsx` with recovery links.
-- Implement segment + global error boundaries with retry actions and safe logging.
-
-**Owned files:**
-- T21: `app/not-found.tsx`
-- T22: `app/error.tsx`, `app/global-error.tsx`
-
-**Wave:** 2  
-**Coordinates with:** FrontendArchitect.
+- Axum router composition with nested workspace routes
+- CORS policy (strict allowlist; credentials true for app domain)
+- Health endpoints: `/health/live` (process), `/health/ready` (DB+deps)
+- Graceful shutdown (drain WS, flush logs, close pool)
+**Final Wave 1 Step:** Smoke tests before Wave 2 unblocks.
 
 ---
 
-## 12. QASpecialist
+## Wave 2 — Frontend (Tasks T21–T40)
 
-**Role:** End-to-end smoke tests and developer documentation.
-
+### `agent.frontend-platform-engineer`
+**Role:** SvelteKit foundation, build pipeline, and resilience primitives.
+**Tasks:** T21, T22, T23, T24, T39
 **Capabilities:**
-- Playwright E2E covering: signup → create habit → toggle → streak → weekly grid → logout.
-- Author `README.md` covering local setup, env vars, Supabase migration steps, and deploy-to-Vercel notes.
+- SvelteKit + Vite + TypeScript strict mode
+- Tailwind config aligned to design tokens
+- Global error boundary + toast system + skeleton/empty/offline fallback components
+- Retry utilities with exponential backoff + offline queue (IndexedDB-backed)
+**Hand-off:** Every UI agent below uses these primitives — no custom error/toast paths.
 
-**Owned files (T10):**
-- `tests/e2e/habits.spec.ts`
-- `README.md`
+### `agent.design-system-engineer`
+**Role:** Premium visual language — components, theming, motion.
+**Tasks:** T27, T36, T37
+**Capabilities:**
+- Headless component primitives (Button, Card, Input) with variant API
+- CSS custom properties for dark/light themes; `prefers-color-scheme` + manual override
+- Mobile-first responsive nav (sidebar collapse, mobile drawer)
+- Animation utilities (Svelte transitions, FLIP, spring physics) — the "design signature"
+**Aesthetic Bar:** Screenshot-worthy by default.
 
-**Wave:** 2 (final)  
-**Coordinates with:** All agents — runs after T07/T08/T09 land.
+### `agent.app-experience-engineer`
+**Role:** User-facing flows — auth, workspaces, dashboards, widgets, sharing.
+**Tasks:** T25, T26, T28, T29, T38
+**Capabilities:**
+- Auth pages with form validation + protected route guards via `hooks.server.ts`
+- Workspace selector + tenant-aware layout
+- Bento-grid layout engine with drag/resize (pointer events, keyboard a11y)
+- Widget plugin system (Chart, Metric, Table) with config panels
+- Public share tokens + PNG/PDF export
+**UX Discipline:** Optimistic updates everywhere a user clicks.
+
+### `agent.data-experience-engineer`
+**Role:** Data source UIs, query builder, billing, analytics, members.
+**Tasks:** T31, T32, T33, T34, T35
+**Capabilities:**
+- Data source connection wizard with credential masking
+- Visual query builder (filters, group-by, time range) compiling to backend metric queries
+- Mollie checkout redirect flow + subscription management UI
+- Workspace analytics charts + activity feed
+- Member invite/list/role management
+**Reuses:** Chart components from `agent.app-experience-engineer`.
+
+### `agent.realtime-client-engineer`
+**Role:** WebSocket client, caching, and live state synchronization.
+**Tasks:** T30, T40
+**Capabilities:**
+- Reconnecting WebSocket client with backoff + connection status store
+- Optimistic update layer with rollback on server reject
+- Cache store with TTL + tag-based invalidation
+- Conflict resolution for concurrent dashboard edits (last-write-wins with toast warning)
+**Dependencies:** Pairs tightly with `agent.realtime-engineer` (Wave 1) on protocol.
 
 ---
 
-## File Ownership Index (Conflict Prevention)
+## Coordination Protocol
 
-| Path prefix | Owner |
+| Stage | Gate Criteria |
 |---|---|
-| `app/api/auth/**` | AuthSpecialist |
-| `app/api/habits/**` | APISpecialist |
-| `app/api/summary/**` | AnalyticsSpecialist |
-| `app/api/me/**` | AuthSpecialist |
-| `app/(app)/**` | FrontendArchitect (except `summary/` → AnalyticsSpecialist) |
-| `app/login`, `app/signup`, `app/auth/**`, `app/forgot-password`, `app/reset-password`, `middleware.ts` | AuthSpecialist |
-| `app/page.tsx` | FrontendArchitect |
-| `app/not-found.tsx`, `app/error.tsx`, `app/global-error.tsx` | ReliabilitySpecialist |
-| `app/layout.tsx`, `app/globals.css` |
+| Wave 0 → 1 | T01–T07 merged; CI green; SurrealDB schema applied in dev |
+| Wave 1 → 2 | T19/T20 merged; `/health/ready` returns 200; OpenAPI spec published |
+| Wave 2 → Release | All 40 tasks merged; e2e suite green; Lighthouse ≥ 90 mobile |
+
+**Conflict Resolution:** Lead architect arbitrates cross-agent file disputes within 1 business day.
+**Escalation Triggers:** Any task exceeding 1.5× estimated duration, any cross-wave dependency violation, any new external service introduction.
